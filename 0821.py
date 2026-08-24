@@ -307,14 +307,14 @@ for dt in eval_dates:
 
 df_eval = pd.DataFrame(daily_metrics)
 m_diag, m_off = df_eval["RMSE_diag"].mean(), df_eval["RMSE_offdiag"].mean()
-n_diag, n_off = m_diag / 207.6, m_off / 19.7
+n_diag, n_off = m_diag / 26.57, m_off / 0.0176
 final_score = 0.5 * n_diag + 0.5 * n_off
 
 print("-" * 75)
 print(f"🔹 Step 1 | Mean RMSE (Diag):        {m_diag:8.4f}")
 print(f"🔹 Step 2 | Mean RMSE (Off-Diag):    {m_off:8.4f}")
-print(f"🔸 Step 3 | NRMSE (Diag)   [/207.6]: {n_diag:8.4f}")
-print(f"🔸 Step 3 | NRMSE (Off-Diag) [/19.7]: {n_off:8.4f}")
+print(f"🔸 Step 3 | NRMSE (Diag)   [/26.57]: {n_diag:8.4f}")
+print(f"🔸 Step 3 | NRMSE (Off-Diag) [/0.0176]: {n_off:8.4f}")
 print(f"🏆 Step 4 | Combined NRMSE:          {final_score:8.4f}")
 print("-" * 75)
 
