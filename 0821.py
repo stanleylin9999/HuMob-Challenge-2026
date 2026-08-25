@@ -30,7 +30,7 @@ CLASS_INFO_MAP = {
 }
 
 GAP_START = pd.to_datetime("2024-02-01")
-GAP_END = pd.to_datetime("2024-04-30")
+GAP_END = pd.to_datetime("2024-03-31")
 PRED_START = pd.to_datetime("2024-01-01")
 PRED_END = pd.to_datetime("2024-10-31")
 
@@ -160,11 +160,11 @@ l_jan_end = (jan_sub / jan_factors).median().fillna(M_pre_robust)
 # 預先提取 1 月初峰值 (用於 Class 7 震後激增包絡線)
 jan_peaks = flow_df.loc["2024-01-01":"2024-01-10", valid_grids].max().fillna(l_jan_end)
 
-may_sub = flow_df.loc["2024-05-01":"2024-05-07"] if "2024-05-01" in flow_df.index else flow_df.loc["2024-04-01":"2024-04-07"]
-may_factors = pd.DataFrame([get_cycle_factor(dt, valid_grids) for dt in may_sub.index], index=may_sub.index)
-l_resume_start = (may_sub / may_factors).median().fillna(l_jan_end)
+april_sub = flow_df.loc["2024-04-01":"2024-04-07"] if "2024-04-01" in flow_df.index else flow_df.loc["2024-03-01":"2024-03-07"]
+may_factors = pd.DataFrame([get_cycle_factor(dt, valid_grids) for dt in april_sub.index], index=april_sub.index)
+l_resume_start = (april_sub / may_factors).median().fillna(l_jan_end)
 
-post_sub = flow_df.loc["2024-05-01":"2024-10-31"] if "2024-05-01" in flow_df.index else flow_df.loc["2024-04-01":"2024-10-31"]
+post_sub = flow_df.loc["2024-04-01":"2024-10-31"] if "2024-04-01" in flow_df.index else flow_df.loc["2024-03-01":"2024-10-31"]
 post_factors = pd.DataFrame([get_cycle_factor(dt, valid_grids) for dt in post_sub.index], index=post_sub.index)
 l_long_term = (post_sub / post_factors).median().fillna(l_resume_start)
 
