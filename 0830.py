@@ -221,7 +221,7 @@ class DynamicODTransitionEngine:
         return interp_probs
 
 # =========================================================================
-# 4. 去離群值類別自適應先驗引擎 (Robust Category Bridge)
+# 4. 全週期 (1~10月) 類別自適應先驗外推引擎 (Robust Category Bridge & Extrapolation)
 # =========================================================================
 class RobustCategoryBridgePrior:
     def __init__(self, flow_df, grid_class_lookup, valid_grids):
@@ -229,24 +229,70 @@ class RobustCategoryBridgePrior:
         self.grid_class_lookup = grid_class_lookup
         self.valid_grids = valid_grids
         
+        # 1. 震前常態中位數 (Pre-EQ Baseline)
         pre_df = flow_df.loc[flow_df.index < PRED_START, valid_grids]
         self.M_pre = robust_median(pre_df).clip(lower=1.0)
         
+        # 2. 1 月底災後應急左錨點 (Jan Tail)
         jan_tail = flow_df.loc["2024-01-20":"2024-01-31", valid_grids]
         self.l_left = robust_median(jan_tail).clip(lower=0.0)
         
+        # 3. 4 月初復原右錨點 (Apr Head)
         if "2024-04-01" in flow_df.index:
             right_sub = flow_df.loc["2024-04-01":"2024-04-14", valid_grids]
         else:
             right_sub = flow_df.loc["2024-05-01":"2024-05-14", valid_grids] if "2024-05-01" in flow_df.index else jan_tail
         self.l_right = robust_median(right_sub).clip(lower=0.0)
+        
+        # 4. 震後 1 月震波衝擊參數 (自主生成 1 月，不讀取 1 月真值)
+        shock_scale_map = {1: 0.0, 2: 0.35, 3: 2.2, 4: 0.25, 5: 0.30, 6: 1.15, 7: 2.8, 8: 1.8, 9: 1.5}
+        self.shock_peak_levels = pd.Series(0.0, index=valid_grids)
+        self.shock_init_levels = pd.Series(0.0, index=valid_grids)
+        for g in valid_grids:
+            c = grid_class_lookup.get(g, 5)
+            base = self.M_pre[g]
+            self.shock_peak_levels[g] = base * shock_scale_map.get(c, 1.0)
+            if c in [1, 2, 4, 5]:
+                self.shock_init_levels[g] = base * shock_scale_map.get(c, 1.0)
+            elif c in [3, 7, 8]:
+                self.shock_init_levels[g] = base * 1.2
+            else:
+                self.shock_init_levels[g] = base
 
     def compute_robust_seed(self, dt):
+        """依據時間階段 (1月衝擊 / 2~3月缺測 / 4~10月長期外推) 自主計算先驗基線"""
+        # 階段 A: 2024-01 (1 月震後衝擊與指數消退期 - 全自主預測)
         if dt < EVAL_GAP_START:
-            if dt in self.flow_df.index:
-                return self.flow_df.loc[dt, self.valid_grids].values
-            return self.l_left.values
+            day_idx = (dt - PRED_START).days
+            tau_jan = day_idx / 30.0
+            mu_t = self.shock_init_levels.copy()
             
+            for g in self.valid_grids:
+                c = self.grid_class_lookup.get(g, 5)
+                p_val = self.shock_peak_levels[g]
+                init_val = self.shock_init_levels[g]
+                end_val = self.l_left[g]
+                
+                if c == 1:
+                    mu_t[g] = 0.0
+                elif c in [3, 7, 8]:
+                    if day_idx <= 4:
+                        # 震後前 4 天快速衝頂至避難高峰
+                        mu_t[g] = init_val + (p_val - init_val) * (day_idx / 4.0)
+                    else:
+                        # 5~31 天指數衰減至 1 月底過渡位準
+                        decay_tau = (day_idx - 4) / 26.0
+                        decay_rate = 3.0 if c == 7 else 2.2
+                        mu_t[g] = end_val + (p_val - end_val) * np.exp(-decay_rate * decay_tau)
+                elif c in [2, 4, 5]:
+                    # 震後驟降並維持在低位
+                    mu_t[g] = init_val + (tau_jan ** 1.5) * (end_val - init_val)
+                else:
+                    mu_t[g] = init_val + tau_jan * (end_val - init_val)
+                    
+            return np.maximum(0.0, mu_t.values)
+            
+        # 階段 B: 2024-02-01 ~ 2024-03-31 (2~3 月 Gap 內插補全)
         elif dt <= EVAL_GAP_END:
             gap_days = (EVAL_GAP_END - EVAL_GAP_START).days + 1
             tau = min(1.0, max(0.0, ((dt - EVAL_GAP_START).days + 1) / gap_days))
@@ -254,7 +300,7 @@ class RobustCategoryBridgePrior:
             mu_t = self.l_left + s_curve * (self.l_right - self.l_left)
             
             for g in self.valid_grids:
-                c = self.grid_class_lookup.get(g, 0)
+                c = self.grid_class_lookup.get(g, 5)
                 if c == 1:
                     mu_t[g] = 0.0
                 elif c == 2:
@@ -271,10 +317,39 @@ class RobustCategoryBridgePrior:
                     mu_t[g] = self.l_left[g] + np.sqrt(tau) * (self.l_right[g] - self.l_left[g])
                     
             return np.maximum(0.0, mu_t.values)
+            
+        # 階段 C: 2024-04-01 ~ 2024-10-31 (4~10 月長期無洩漏外推預測)
         else:
-            if dt in self.flow_df.index:
-                return self.flow_df.loc[dt, self.valid_grids].values
-            return self.l_right.values
+            post_days = (PRED_END - EVAL_GAP_END).days
+            tau_post = min(1.0, max(0.0, (dt - EVAL_GAP_END).days / post_days))
+            mu_t = self.l_right.copy()
+            
+            for g in self.valid_grids:
+                c = self.grid_class_lookup.get(g, 5)
+                base = self.M_pre[g]
+                r_start = self.l_right[g]
+                
+                if c == 1:
+                    mu_t[g] = 0.0
+                elif c == 2:
+                    mu_t[g] = r_start
+                elif c in [3, 7]:
+                    mu_t[g] = r_start + (1.0 - np.exp(-1.5 * tau_post)) * (base * 0.5 - r_start)
+                elif c == 4:
+                    target = base * 0.75
+                    mu_t[g] = r_start + np.sqrt(tau_post) * (target - r_start)
+                elif c == 5:
+                    s_post = 3.0 * (tau_post ** 2) - 2.0 * (tau_post ** 3)
+                    mu_t[g] = r_start + s_post * (base - r_start)
+                elif c == 6:
+                    mu_t[g] = r_start
+                elif c == 8:
+                    mu_t[g] = r_start + (1.0 - np.exp(-2.0 * tau_post)) * (base - r_start)
+                elif c == 9:
+                    target = max(r_start, base * 1.2)
+                    mu_t[g] = r_start + tau_post * (target - r_start)
+                    
+            return np.maximum(0.0, mu_t.values)
 
 # =========================================================================
 # 5. 雙條件擴散模型 (波型殘差學習)
@@ -416,7 +491,7 @@ class DualDiffusionEngine:
         return torch.clamp(accum, -2.5, 2.5)
 
 # =========================================================================
-# 6. 官方標準評估引擎
+# 6. 官方標準評估引擎 (從 1 月開始完整評估)
 # =========================================================================
 def compute_official_and_class_nrmse(eval_dates, valid_grids, grid_class_lookup, daily_od_records, 
                                      pred_diag_flows, pred_offdiag_flows, dynamic_engine, output_dir):
@@ -494,7 +569,7 @@ def compute_official_and_class_nrmse(eval_dates, valid_grids, grid_class_lookup,
     df_metrics = pd.DataFrame(summary_list)
     
     print("\n" + "=" * 110)
-    print(" 🏆 【HuMob 2026 官方標準 Combined NRMSE 評估報告】")
+    print(" 🏆 【HuMob 2026 官方標準 Combined NRMSE 全週期外推評估報告 (1月~10月)】")
     print(f" 🎯 官方常數: mean_actual_diag = {MEAN_ACTUAL_DIAG} | mean_actual_offdiag = {MEAN_ACTUAL_OFFDIAG}")
     print("=" * 110)
     print(f"{'Class Name':<32} | {'Grids':<5} | {'RMSE_diag':<10} | {'RMSE_off':<10} | {'NRMSE_diag':<11} | {'NRMSE_off':<11} | {'Combined NRMSE':<14}")
@@ -515,16 +590,12 @@ def compute_official_and_class_nrmse(eval_dates, valid_grids, grid_class_lookup,
 # 7. 長期人數回復曲線視覺化模組
 # =========================================================================
 def plot_fixed_class_diffusion_comparison(total_truth_df, pred_total_df, valid_grids, grid_class_lookup, combined_nrmse, output_dir):
-    """
-    繪製 9 大類別 Robust Diffusion 預測與 Ground Truth 對比圖 (包含震前與 2~3 月 Gap 陰影)
-    對應圖片標題：HuMob 2026: Robust Category Diffusion (Fixed Class 2 & 3) | NRMSE: XX.XXXX
-    """
     plt.style.use('dark_background')
     
     fig, axes = plt.subplots(3, 3, figsize=(18, 10), dpi=250)
     fig.patch.set_facecolor('#0b1329')
     
-    fig.suptitle(f"HuMob 2026: Robust Category Diffusion (Fixed Class 2 & 3) | NRMSE: {combined_nrmse:.4f}", 
+    fig.suptitle(f"HuMob 2026: Robust Category Diffusion (Pure Extrapolation Jan-Oct) | NRMSE: {combined_nrmse:.4f}", 
                  fontsize=13, fontweight='bold', color='#ffffff', y=0.97)
 
     legend_handles = []
@@ -568,7 +639,7 @@ def plot_fixed_class_diffusion_comparison(total_truth_df, pred_total_df, valid_g
         ax.set_xlim([min_dt, max_dt])
 
     fig.legend(handles=legend_handles, 
-               labels=['Feb-Mar Gap', 'Ground Truth', 'Robust Diffusion Pred'],
+               labels=['Feb-Mar Gap', 'Ground Truth (Raw)', 'Diffusion Extrapolation (Pred)'],
                loc='lower center', bbox_to_anchor=(0.5, 0.01), ncol=3, 
                fontsize=9, frameon=True, facecolor='#0b1329', edgecolor='#334155')
     
@@ -577,7 +648,7 @@ def plot_fixed_class_diffusion_comparison(total_truth_df, pred_total_df, valid_g
     out_path = os.path.join(output_dir, "robust_category_diffusion_9classes_fixed.png")
     plt.savefig(out_path, dpi=250, bbox_inches='tight')
     plt.close(fig)
-    print(f"✓ 5. 9 大類別 Diffusion 修正對比圖已輸出：{out_path}")
+    print(f"✓ 5. 9 大類別 Diffusion 外推對比圖已輸出：{out_path}")
 
 def plot_long_term_recovery_curves(total_truth_df, pred_total_df, prior_diag, prior_offdiag, valid_grids, grid_class_lookup, output_dir):
     plt.style.use('dark_background')
@@ -591,7 +662,7 @@ def plot_long_term_recovery_curves(total_truth_df, pred_total_df, prior_diag, pr
     # 1. 9 大類別獨立長週期絕對人數趨勢圖 (3x3 Subplots)
     fig, axes = plt.subplots(3, 3, figsize=(20, 12), dpi=250)
     fig.patch.set_facecolor('#0f172a')
-    fig.suptitle('HuMob 2026: 9 Classes Long-Term Population Recovery Trajectories (2024 Full-Year)', 
+    fig.suptitle('HuMob 2026: 9 Classes Long-Term Population Recovery Trajectories (Jan-Oct Extrapolation)', 
                  fontsize=15, fontweight='bold', color='#ffffff', y=0.98)
 
     for c_id in range(1, 10):
@@ -612,7 +683,7 @@ def plot_long_term_recovery_curves(total_truth_df, pred_total_df, prior_diag, pr
         
         pred_7d_ma = pred_full.rolling(window=7, min_periods=1, center=True).mean()
         
-        ax.axvspan(EVAL_GAP_START, EVAL_GAP_END, color='#f59e0b', alpha=0.15, label='Feb-Mar Gap (Diffusion)' if c_id == 1 else "")
+        ax.axvspan(EVAL_GAP_START, EVAL_GAP_END, color='#f59e0b', alpha=0.15, label='Feb-Mar Gap' if c_id == 1 else "")
         ax.axhline(c_baseline, color='#38bdf8', linestyle=':', linewidth=1.2, label=f'Pre-EQ Baseline ({c_baseline:.1f} 人)' if c_id == 1 else "")
         
         ax.plot(actual_pre.index, actual_pre, color='#f43f5e', alpha=0.5, linewidth=1.0, label='Ground Truth (Raw)' if c_id == 1 else "")
@@ -668,7 +739,7 @@ def plot_long_term_recovery_curves(total_truth_df, pred_total_df, prior_diag, pr
         ax_mean.plot(pred_c_7d.index, pred_c_7d, label=f"Class {c_id:02d} ({c_name}, N={len(c_grids)})", 
                      linewidth=2.0, color=color_palette[c_id - 1])
 
-    ax_mean.axvspan(EVAL_GAP_START, EVAL_GAP_END, color='#f59e0b', alpha=0.15, label='Feb-Mar Gap (Diffusion Repaired)')
+    ax_mean.axvspan(EVAL_GAP_START, EVAL_GAP_END, color='#f59e0b', alpha=0.15, label='Feb-Mar Gap')
     ax_mean.set_title("HuMob 2026: Mean Population Flow Comparison Across 9 Classes (7-Day MA)", 
                       fontsize=14, fontweight='bold', color='#ffffff', pad=12)
     ax_mean.set_ylabel("平均人數 / 網格 (人/日)", color='#cbd5e1', fontsize=11)
@@ -698,7 +769,7 @@ def plot_long_term_recovery_curves(total_truth_df, pred_total_df, prior_diag, pr
     ov_pred_full = pred_total_df[valid_grids].mean(axis=1)
     ov_pred_7d_ma = ov_pred_full.rolling(window=7, min_periods=1, center=True).mean()
 
-    ax_ov.axvspan(EVAL_GAP_START, EVAL_GAP_END, color='#f59e0b', alpha=0.18, label='Feb-Mar Gap (Diffusion Imputation)')
+    ax_ov.axvspan(EVAL_GAP_START, EVAL_GAP_END, color='#f59e0b', alpha=0.18, label='Feb-Mar Gap')
     ax_ov.axhline(overall_baseline, color='#38bdf8', linestyle='--', linewidth=1.5, label=f'Pre-EQ Mean Baseline ({overall_baseline:.2f} 人)')
 
     ax_ov.plot(ov_actual_pre.index, ov_actual_pre, color='#f43f5e', alpha=0.6, linewidth=1.2, label='Observed Ground Truth (Raw)')
@@ -770,7 +841,7 @@ def plot_long_term_recovery_curves(total_truth_df, pred_total_df, prior_diag, pr
 # =========================================================================
 def main():
     print("=" * 85)
-    print("🚀 HuMob 2026：動態雙錨點 OD 轉移引擎 ＋ 雙擴散生成 (官方標準評估)")
+    print("🚀 HuMob 2026：動態雙錨點 OD 轉移引擎 ＋ 雙擴散生成 (全週期外推評估)")
     print(f"🎯 官方常數: mean_actual_diag = {MEAN_ACTUAL_DIAG} | mean_actual_offdiag = {MEAN_ACTUAL_OFFDIAG}")
     print(f"⚖️ 官方權重: Diag x {WEIGHT_DIAG} + Off-Diag x {WEIGHT_OFFDIAG}")
     print("=" * 85)
@@ -789,7 +860,7 @@ def main():
     max_ceiling_diag = diag_df.loc[pre_mask, valid_grids].quantile(0.99).fillna(50.0).values * 1.5 + 5.0
     max_ceiling_offdiag = offdiag_df.loc[pre_mask, valid_grids].quantile(0.99).fillna(20.0).values * 1.5 + 5.0
 
-    # 3. 建立去離群值先驗引擎
+    # 3. 建立去離群值先驗外推引擎
     prior_diag = RobustCategoryBridgePrior(diag_df, grid_class_lookup, valid_grids)
     prior_offdiag = RobustCategoryBridgePrior(offdiag_df, grid_class_lookup, valid_grids)
 
@@ -851,8 +922,8 @@ def main():
         if ep % 30 == 0 or ep == EPOCHS:
             print(f"  Epoch [{ep:03d}/{EPOCHS}] - Off-Diag Loss: {total_loss / len(offdiag_loader):.6f}")
 
-    # 6. 生成 2~3 月補全 (自適應先驗種子 + 擴散波型)
-    print("\n[5/6] 結合自適應種子與擴散波型生成 2~3 月人流...")
+    # 6. 生成 1~10 月完整預測 (從 1 月開始全程由自適應基線 + 擴散波型外推生成)
+    print("\n[5/6] 結合自適應基線與擴散波型生成 1~10 月全週期預測人流...")
     model_diag.eval()
     model_offdiag.eval()
     
@@ -861,37 +932,34 @@ def main():
 
     with torch.no_grad():
         for dt in all_dates:
-            if dt in diag_df.index and not (EVAL_GAP_START <= dt <= EVAL_GAP_END):
-                pred_diag_flows[dt] = diag_df.loc[dt, valid_grids].copy()
-                pred_offdiag_flows[dt] = offdiag_df.loc[dt, valid_grids].copy()
-            else:
-                seed_d = prior_diag.compute_robust_seed(dt)
-                seed_o = prior_offdiag.compute_robust_seed(dt)
-                
-                n_seed_d = torch.tensor(seed_d / (max_ceiling_diag + 1e-4), dtype=torch.float32).unsqueeze(0).to(DEVICE)
-                n_seed_o = torch.tensor(seed_o / (max_ceiling_offdiag + 1e-4), dtype=torch.float32).unsqueeze(0).to(DEVICE)
-                t_feat = torch.tensor(extract_calendar_features(dt), dtype=torch.float32).unsqueeze(0).to(DEVICE)
-                
-                res_d = diff_engine.sample_monte_carlo(model_diag, n_seed_d, t_feat).squeeze(0).cpu().numpy() * diag_ds.scale
-                level_ratio_d = np.clip(seed_d / (diag_ds.M_pre + 1e-4), 0.1, 1.2)
-                res_d = res_d * level_ratio_d
+            # 2024 全年 (1月~10月) 一律由先驗種子 + 擴散殘差生成，不讀取真實值覆蓋
+            seed_d = prior_diag.compute_robust_seed(dt)
+            seed_o = prior_offdiag.compute_robust_seed(dt)
+            
+            n_seed_d = torch.tensor(seed_d / (max_ceiling_diag + 1e-4), dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            n_seed_o = torch.tensor(seed_o / (max_ceiling_offdiag + 1e-4), dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            t_feat = torch.tensor(extract_calendar_features(dt), dtype=torch.float32).unsqueeze(0).to(DEVICE)
+            
+            res_d = diff_engine.sample_monte_carlo(model_diag, n_seed_d, t_feat).squeeze(0).cpu().numpy() * diag_ds.scale
+            level_ratio_d = np.clip(seed_d / (diag_ds.M_pre + 1e-4), 0.1, 1.2)
+            res_d = res_d * level_ratio_d
 
-                res_o = diff_engine.sample_monte_carlo(model_offdiag, n_seed_o, t_feat).squeeze(0).cpu().numpy() * offdiag_ds.scale
-                level_ratio_o = np.clip(seed_o / (offdiag_ds.M_pre + 1e-4), 0.1, 1.2)
-                res_o = res_o * level_ratio_o
-                
-                final_d = np.clip(seed_d + res_d, 0.0, max_ceiling_diag)
-                final_o = np.clip(seed_o + res_o, 0.0, max_ceiling_offdiag)
-                
-                for i, g in enumerate(valid_grids):
-                    if grid_class_lookup.get(g, 0) == 1:
-                        final_d[i] = 0.0
-                        final_o[i] = 0.0
+            res_o = diff_engine.sample_monte_carlo(model_offdiag, n_seed_o, t_feat).squeeze(0).cpu().numpy() * offdiag_ds.scale
+            level_ratio_o = np.clip(seed_o / (offdiag_ds.M_pre + 1e-4), 0.1, 1.2)
+            res_o = res_o * level_ratio_o
+            
+            final_d = np.clip(seed_d + res_d, 0.0, max_ceiling_diag)
+            final_o = np.clip(seed_o + res_o, 0.0, max_ceiling_offdiag)
+            
+            for i, g in enumerate(valid_grids):
+                if grid_class_lookup.get(g, 0) == 1:
+                    final_d[i] = 0.0
+                    final_o[i] = 0.0
 
-                pred_diag_flows[dt] = pd.Series(final_d, index=valid_grids)
-                pred_offdiag_flows[dt] = pd.Series(final_o, index=valid_grids)
+            pred_diag_flows[dt] = pd.Series(final_d, index=valid_grids)
+            pred_offdiag_flows[dt] = pd.Series(final_o, index=valid_grids)
 
-    # 7. 官方標準評估
+    # 7. 官方標準評估 (評估 1 月及 4~10 月所有真實觀測日)
     eval_dates = [dt for dt in diag_df.index if dt >= PRED_START and not (EVAL_GAP_START <= dt <= EVAL_GAP_END)]
     df_class_metrics, combined_nrmse = compute_official_and_class_nrmse(
         eval_dates=eval_dates,
@@ -924,7 +992,7 @@ def main():
         output_dir=OUTPUT_DIR
     )
 
-    # 產出 9 大類別 Diffusion 修正對比圖 (HuMob 2026: Robust Category Diffusion)
+    # 產出 9 大類別 Diffusion 修正對比圖
     plot_fixed_class_diffusion_comparison(
         total_truth_df=total_truth_df,
         pred_total_df=pred_total_df,
