@@ -9,18 +9,21 @@ import matplotlib.dates as mdates
 from scipy.spatial.distance import cdist
 
 # =========================================================================
-# 1. 環境與全域設定
+# 1. 環境與全域設定 (官方標準常數與時間軸)
 # =========================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
 TSV_PATH = os.path.join(SCRIPT_DIR, "humob2026-dataset.tsv")
-BY_CLASS_DIR = os.path.join(SCRIPT_DIR, "humob2026", "data", "output", "module05", "classification", "by_class")
+SPECIFIC_CLASS_DIR = r"C:\Users\User\Desktop\人口預測專案\人口預測專案3\humob2026\data\output\module05\classification\by_class"
+FALLBACK_CLASS_DIR = os.path.join(SCRIPT_DIR, "humob2026", "data", "output", "module05", "classification", "by_class")
+BY_CLASS_DIR = SPECIFIC_CLASS_DIR if os.path.exists(SPECIFIC_CLASS_DIR) else FALLBACK_CLASS_DIR
+
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "humob_pipeline_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 CLASS_INFO_MAP = {
     1: "Class 01: Persistent Zero",
     2: "Class 02: Persistent Decrease",
-    3: "Class 03: Emergent / Temporary Activity",
+    3: "Class 03: Emergent Activity",
     4: "Class 04: Partial Recovery",
     5: "Class 05: Fully Recovered",
     6: "Class 06: Stable Inflow",
@@ -29,13 +32,18 @@ CLASS_INFO_MAP = {
     9: "Class 09: Persistent Increase"
 }
 
+MEAN_ACTUAL_DIAG = 26.57
+MEAN_ACTUAL_OFFDIAG = 0.0176
+WEIGHT_DIAG = 0.5
+WEIGHT_OFFDIAG = 0.5
+
+PRED_START = pd.to_datetime("2024-01-01")
 GAP_START = pd.to_datetime("2024-02-01")
 GAP_END = pd.to_datetime("2024-03-31")
-PRED_START = pd.to_datetime("2024-01-01")
 PRED_END = pd.to_datetime("2024-10-31")
 
 print("=" * 80)
-print("🚀 HuMob 動態非線性預測流程：類別形態學優化 (Class 07 消退修復) ➔ NRMSE 評估")
+print("🚀 HuMob 動態非線性預測流程：類別形態學優化 (Class 07 消退修復) ➔ 各類別 NRMSE 評估")
 print(f"📁 缺測斷線區間: {GAP_START.strftime('%Y-%m-%d')} ~ {GAP_END.strftime('%Y-%m-%d')}")
 print("=" * 80)
 
@@ -88,7 +96,7 @@ for dt, val in zip(raw_df['date_dt'], raw_df['od_matrix_raw']):
             y_idx, x_idx = map(int, orig.split('_'))
             if 30 <= x_idx <= 70 and 35 <= y_idx <= 70:
                 daily_od_records[dt][orig] = dests
-                daily_grid_flows[dt][orig] = sum(dests.values())
+                daily_grid_flows[dt][orig] = sum(float(cnt) for cnt in dests.values())
     except Exception:
         pass
 
@@ -97,6 +105,10 @@ valid_grids = [g for g in flow_df.columns if g in grid_class_lookup]
 if not valid_grids:
     pre_mask_temp = flow_df.index < PRED_START
     valid_grids = flow_df.columns[flow_df[pre_mask_temp].mean() >= 0.001].tolist()
+
+for g in valid_grids:
+    if g not in grid_class_lookup:
+        grid_class_lookup[g] = 5
 
 flow_df = flow_df[valid_grids]
 pre_mask = flow_df.index < PRED_START
@@ -124,7 +136,7 @@ for (wom, dow), group in pre_df.groupby(['week_of_month', 'dow']):
 robust_cycle_patterns = pd.DataFrame(clean_records).set_index(['week_of_month', 'dow'])
 M_pre_robust = pre_df[valid_grids].median().replace(0, 1.0)
 dow_medians_pre = pre_df.groupby('dow')[valid_grids].median()
-max_pre_allowable = pre_df[valid_grids].quantile(0.98) * 1.6 + 5.0  # 防極端值上限天花板
+max_pre_allowable = pre_df[valid_grids].quantile(0.98) * 1.6 + 5.0
 
 def get_cycle_factor(dt, grid_list):
     wom = min((dt.day - 1) // 7 + 1, 4)
@@ -168,51 +180,46 @@ post_sub = flow_df.loc["2024-04-01":"2024-10-31"] if "2024-04-01" in flow_df.ind
 post_factors = pd.DataFrame([get_cycle_factor(dt, valid_grids) for dt in post_sub.index], index=post_sub.index)
 l_long_term = (post_sub / post_factors).median().fillna(l_resume_start)
 
-# 5. 執行全期動態生成 (含受控微波動 AR(1) 與優化後的類別動態)
-np.random.seed(42)
-full_pred_dates = pd.date_range(PRED_START, PRED_END, freq="D")
-gap_span = (GAP_END - GAP_START).days + 1
-
-ar_state = pd.Series(0.0, index=valid_grids)
-pred_grid_records = {}
-
-# 震前歷史 OD 轉移機率
+# 5. 震前歷史 OD 轉移機率
 hist_od_trans_prob = {g: {} for g in valid_grids}
 for dt in flow_df[pre_mask].index:
     day_od = daily_od_records.get(dt, {})
     for orig in valid_grids:
         if orig in day_od:
             for dest, cnt in day_od[orig].items():
-                hist_od_trans_prob[orig][dest] = hist_od_trans_prob[orig].get(dest, 0.0) + cnt
+                if dest != "-1_-1":
+                    hist_od_trans_prob[orig][dest] = hist_od_trans_prob[orig].get(dest, 0.0) + float(cnt)
 
 smoothed_od_prob = {}
 for orig in valid_grids:
     total_c = sum(hist_od_trans_prob[orig].values())
     smoothed_od_prob[orig] = {d: c / total_c for d, c in hist_od_trans_prob[orig].items()} if total_c > 0 else {orig: 1.0}
 
+# 6. 執行全期動態生成
+np.random.seed(42)
+full_pred_dates = pd.date_range(PRED_START, PRED_END, freq="D")
+gap_span = (GAP_END - GAP_START).days + 1
+
+ar_state = pd.Series(0.0, index=valid_grids)
+pred_grid_records = {}
 pred_od_records = {}
 
 for dt in full_pred_dates:
     r_t = get_cycle_factor(dt, valid_grids)
     
-    # -------------------------------------------------------------
-    # 基礎位準趨勢計算 (重點優化 Class 7)
-    # -------------------------------------------------------------
+    # 基礎位準趨勢計算
     if dt < GAP_START:
         day_idx = (dt - PRED_START).days
         tau = day_idx / 30.0
         jan_init = flow_df.loc["2024-01-01":"2024-01-05"].median().fillna(l_jan_end)
         mu_t = jan_init + (tau ** 1.3) * (l_jan_end - jan_init)
         
-        # 【修改點 1】Class 07 在 1 月份的激增與衰退包絡線
         for g in valid_grids:
             if grid_class_lookup.get(g, 0) == 7:
                 p_val = jan_peaks[g]
                 if day_idx <= 4:
-                    # 震後前 4 天快速衝頂
                     mu_t[g] = jan_init[g] + (p_val - jan_init[g]) * (day_idx / 4.0)
                 else:
-                    # 5~31 天指數衰減至 1 月底
                     decay_tau = (day_idx - 4) / 26.0
                     mu_t[g] = l_jan_end[g] + (p_val - l_jan_end[g]) * np.exp(-2.5 * decay_tau)
 
@@ -221,46 +228,32 @@ for dt in full_pred_dates:
         s_curve = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
         mu_t = l_jan_end + s_curve * (l_resume_start - l_jan_end)
         
-        # 類別專屬特徵
         for g in valid_grids:
             c = grid_class_lookup.get(g, 0)
-            
-            if c == 3:  # 僅保留 Class 03 避難活動波峰
+            if c == 3:
                 peak_factor = np.sin(np.pi * tau) * 0.35 * l_jan_end[g]
                 mu_t[g] += peak_factor
-                
             elif c == 7:
-                # 【修改點 2】Class 07 移除正弦波！改採單調平滑消退 (Dissipation)
-                # 從 1 月底殘餘高位平滑過渡消散至 5 月初水準，杜絕 3 月假雙峰
                 dissip_curve = 1.0 - np.exp(-3.0 * tau)
                 mu_t[g] = l_jan_end[g] + dissip_curve * (l_resume_start[g] - l_jan_end[g])
-                
-            elif c == 4:  # Class 04 部分復原：早期緩慢、中後期抬升
+            elif c == 4:
                 mu_t[g] = l_jan_end[g] + (tau ** 2.2) * (l_resume_start[g] - l_jan_end[g])
     else:
         tau_post = min(1.0, (dt - (GAP_END + pd.Timedelta(days=1))).days / 90.0)
         mu_t = l_resume_start + (1.0 - np.exp(-3.0 * tau_post)) * (l_long_term - l_resume_start)
     
-    # -------------------------------------------------------------
     # AR(1) 微擾動生成與邊界防禦
-    # -------------------------------------------------------------
     innovations = pd.Series(np.random.normal(0, 1, len(valid_grids)), index=valid_grids) * grid_volatility * 0.40
     ar_state = 0.68 * ar_state + np.sqrt(1 - 0.68**2) * innovations
     clamped_noise = ar_state.clip(lower=-1.2 * grid_volatility, upper=1.2 * grid_volatility)
     
-    # Class 1 (Persistent Zero) 保持為零
     for g in valid_grids:
         if grid_class_lookup.get(g) == 1:
             clamped_noise[g] = 0.0
             mu_t[g] = 0.0
     
-    # 結合週期、均值趨勢與微擾動
     raw_pred = mu_t * r_t + clamped_noise
-    
-    # 空間輕度平滑
     smooth_pred = 0.95 * raw_pred + 0.05 * spatial_knn_weights.dot(raw_pred)
-    
-    # 嚴格邊界保護
     final_pred = smooth_pred.clip(lower=0.0, upper=max_pre_allowable)
     pred_grid_records[dt] = final_pred
 
@@ -279,44 +272,96 @@ pred_csv_path = os.path.join(OUTPUT_DIR, "full_predictions_dynamic_jan_to_oct.cs
 pred_df.to_csv(pred_csv_path, encoding="utf-8-sig")
 
 # =========================================================================
-# 4. HuMob 官方 Combined NRMSE 評估
+# 4. HuMob 官方 Combined NRMSE 評估 (含各類別詳細分解報表)
 # =========================================================================
-print("\n[3/5] 執行 HuMob Combined NRMSE 評估...")
+print("\n[3/5] 執行 HuMob Combined NRMSE 評估 (各類別獨立統計)...")
 
 eval_dates = [dt for dt in flow_df.index if dt >= PRED_START and not (GAP_START <= dt <= GAP_END)]
-daily_metrics = []
+class_daily_records = {c_id: {"diag": [], "offdiag": []} for c_id in range(1, 10)}
+overall_daily_records = {"diag": [], "offdiag": []}
 
 for dt in eval_dates:
     if dt not in daily_od_records or not daily_od_records[dt]: continue
     act_od, prd_od = daily_od_records[dt], pred_od_records.get(dt, {})
-    diag_diffs, offdiag_diffs = [], []
+    
+    c_diag_diffs = {c_id: [] for c_id in range(1, 10)}
+    c_off_diffs = {c_id: [] for c_id in range(1, 10)}
+    all_diag_diffs, all_off_diffs = [], []
     
     for orig in valid_grids:
-        act_dests, prd_dests = act_od.get(orig, {}), prd_od.get(orig, {})
-        diag_diffs.append((float(prd_dests.get(orig, 0.0)) - float(act_dests.get(orig, 0.0))) ** 2)
+        c_id = grid_class_lookup.get(orig, 5)
+        act_dests = act_od.get(orig, {})
+        prd_dests = prd_od.get(orig, {})
         
+        # 1. 對角線 (i == j) 留存流量平方差
+        d_err_sq = (float(prd_dests.get(orig, 0.0)) - float(act_dests.get(orig, 0.0))) ** 2
+        c_diag_diffs[c_id].append(d_err_sq)
+        all_diag_diffs.append(d_err_sq)
+        
+        # 2. 非對角線 (i != j) 跨區轉移平方差
         all_dests = set(act_dests.keys()).union(set(prd_dests.keys()))
         for dest in all_dests:
             if dest == orig or dest == "-1_-1": continue
-            offdiag_diffs.append((float(prd_dests.get(dest, 0.0)) - float(act_dests.get(dest, 0.0))) ** 2)
+            o_err_sq = (float(prd_dests.get(dest, 0.0)) - float(act_dests.get(dest, 0.0))) ** 2
+            c_off_diffs[c_id].append(o_err_sq)
+            all_off_diffs.append(o_err_sq)
 
-    daily_metrics.append({
-        "RMSE_diag": np.sqrt(np.mean(diag_diffs)) if diag_diffs else 0.0,
-        "RMSE_offdiag": np.sqrt(np.mean(offdiag_diffs)) if offdiag_diffs else 0.0
+    for c_id in range(1, 10):
+        if c_diag_diffs[c_id]:
+            class_daily_records[c_id]["diag"].append(np.sqrt(np.mean(c_diag_diffs[c_id])))
+        if c_off_diffs[c_id]:
+            class_daily_records[c_id]["offdiag"].append(np.sqrt(np.mean(c_off_diffs[c_id])))
+
+    overall_daily_records["diag"].append(np.sqrt(np.mean(all_diag_diffs)) if all_diag_diffs else 0.0)
+    overall_daily_records["offdiag"].append(np.sqrt(np.mean(all_off_diffs)) if all_off_diffs else 0.0)
+
+summary_list = []
+for c_id in range(1, 10):
+    c_grids = [g for g in valid_grids if grid_class_lookup.get(g) == c_id]
+    if not c_grids or len(class_daily_records[c_id]["diag"]) == 0:
+        continue
+
+    rmse_diag_c = float(np.mean(class_daily_records[c_id]["diag"]))
+    rmse_offdiag_c = float(np.mean(class_daily_records[c_id]["offdiag"])) if class_daily_records[c_id]["offdiag"] else 0.0
+    
+    nrmse_diag_c = rmse_diag_c / MEAN_ACTUAL_DIAG
+    nrmse_offdiag_c = rmse_offdiag_c / MEAN_ACTUAL_OFFDIAG
+    comb_nrmse_c = WEIGHT_DIAG * nrmse_diag_c + WEIGHT_OFFDIAG * nrmse_offdiag_c
+
+    summary_list.append({
+        "Class_ID": c_id,
+        "Class_Name": CLASS_INFO_MAP[c_id],
+        "Grid_Count": len(c_grids),
+        "RMSE_diag": rmse_diag_c,
+        "RMSE_offdiag": rmse_offdiag_c,
+        "NRMSE_diag": nrmse_diag_c,
+        "NRMSE_offdiag": nrmse_offdiag_c,
+        "Combined_NRMSE": comb_nrmse_c
     })
 
-df_eval = pd.DataFrame(daily_metrics)
-m_diag, m_off = df_eval["RMSE_diag"].mean(), df_eval["RMSE_offdiag"].mean()
-n_diag, n_off = m_diag / 26.57, m_off / 0.0176
-final_score = 0.5 * n_diag + 0.5 * n_off
+RMSE_diag = float(np.mean(overall_daily_records["diag"]))
+RMSE_offdiag = float(np.mean(overall_daily_records["offdiag"]))
+NRMSE_diag = RMSE_diag / MEAN_ACTUAL_DIAG
+NRMSE_offdiag = RMSE_offdiag / MEAN_ACTUAL_OFFDIAG
+combined_nrmse = WEIGHT_DIAG * NRMSE_diag + WEIGHT_OFFDIAG * NRMSE_offdiag
 
-print("-" * 75)
-print(f"🔹 Step 1 | Mean RMSE (Diag):        {m_diag:8.4f}")
-print(f"🔹 Step 2 | Mean RMSE (Off-Diag):    {m_off:8.4f}")
-print(f"🔸 Step 3 | NRMSE (Diag)   [/26.57]: {n_diag:8.4f}")
-print(f"🔸 Step 3 | NRMSE (Off-Diag) [/0.0176]: {n_off:8.4f}")
-print(f"🏆 Step 4 | Combined NRMSE:          {final_score:8.4f}")
-print("-" * 75)
+df_metrics = pd.DataFrame(summary_list)
+
+print("\n" + "=" * 110)
+print(" 🏆 【HuMob 2026 官方標準 Combined NRMSE 各類別評估報告】")
+print(f" 🎯 官方常數: mean_actual_diag = {MEAN_ACTUAL_DIAG} | mean_actual_offdiag = {MEAN_ACTUAL_OFFDIAG}")
+print("=" * 110)
+print(f"{'Class Name':<32} | {'Grids':<5} | {'RMSE_diag':<10} | {'RMSE_off':<10} | {'NRMSE_diag':<11} | {'NRMSE_off':<11} | {'Combined NRMSE':<14}")
+print("-" * 110)
+for _, row in df_metrics.iterrows():
+    print(f"{row['Class_Name']:<32} | {int(row['Grid_Count']):<5} | {row['RMSE_diag']:10.4f} | {row['RMSE_offdiag']:10.4f} | {row['NRMSE_diag']:11.4f} | {row['NRMSE_offdiag']:11.4f} | {row['Combined_NRMSE']:14.4f}")
+print("-" * 110)
+print(f"{'OVERALL (All Valid Grids)':<32} | {len(valid_grids):<5} | {RMSE_diag:10.4f} | {RMSE_offdiag:10.4f} | {NRMSE_diag:11.4f} | {NRMSE_offdiag:11.4f} | {combined_nrmse:14.4f}")
+print("=" * 110 + "\n")
+
+csv_path = os.path.join(OUTPUT_DIR, "class_dynamic_nrmse_breakdown.csv")
+df_metrics.to_csv(csv_path, index=False, encoding="utf-8-sig")
+print(f"✓ 各類別官方標準 NRMSE 評估表已匯出至：{csv_path}")
 
 # =========================================================================
 # 5. 繪製 9 大類別圖譜
@@ -355,7 +400,7 @@ for c_id in range(1, 10):
 
 fig_grid, axes = plt.subplots(3, 3, figsize=(19, 11.5), dpi=300)
 fig_grid.patch.set_facecolor('#0f172a')
-fig_grid.suptitle(f'Dynamic 9-Class Predictions (Optimized Class 7) | Combined NRMSE: {final_score:.4f}', 
+fig_grid.suptitle(f'Dynamic 9-Class Predictions (Optimized Class 7) | Combined NRMSE: {combined_nrmse:.4f}', 
                   fontsize=15, fontweight='bold', color='#ffffff', y=0.98)
 
 for c_id in range(1, 10):
@@ -365,7 +410,7 @@ for c_id in range(1, 10):
     if c_id not in class_series: continue
 
     data = class_series[c_id]
-    ax.axvspan(GAP_START, GAP_END, color=COLOR_GAP, alpha=0.15, label='Feb-Apr Gap' if c_id == 1 else "")
+    ax.axvspan(GAP_START, GAP_END, color=COLOR_GAP, alpha=0.15, label='Feb-Mar Gap' if c_id == 1 else "")
     ax.plot(data["dates"], data["baseline"], color=COLOR_BASE, linestyle=':', linewidth=1.0, label='Pre-EQ Baseline' if c_id == 1 else "")
     ax.plot(data["dates"], data["actual"], color=COLOR_ACTUAL, linewidth=1.2, label='Actual Flow' if c_id == 1 else "")
     ax.plot(data["pred_dates"], data["pred"], color=COLOR_PRED, linewidth=1.5, label='Dynamic Prediction' if c_id == 1 else "")
