@@ -615,7 +615,7 @@ print("=" * 110 + "\n")
 df_metrics.to_csv(os.path.join(OUTPUT_DIR, "fixed_nrmse_breakdown.csv"), index=False, encoding="utf-8-sig")
 
 # =========================================================================
-# 9. 匯出預測 CSV 與 9 大類別走勢圖
+# 9. 匯出預測 CSV 與 9 大類別走勢圖（已修復 2~3 月斷線問題）
 # =========================================================================
 print("[5/6] 匯出預測檔案與產出 9 大類別走勢圖...")
 pred_diag_df = pd.DataFrame.from_dict(pred_diag_flows, orient='index')
@@ -624,6 +624,7 @@ pred_total_df = pred_diag_df + pred_offdiag_df
 pred_total_df.to_csv(os.path.join(OUTPUT_DIR, "pred_total_flows_fixed.csv"), encoding="utf-8-sig")
 
 total_truth_df = diag_df + offdiag_df
+full_dates = pd.date_range(total_truth_df.index.min(), total_truth_df.index.max(), freq="D")
 
 plt.style.use('dark_background')
 fig, axes = plt.subplots(3, 3, figsize=(19, 11.5), dpi=250)
@@ -641,7 +642,8 @@ for c_id in range(1, 10):
         ax.set_title(CLASS_INFO_MAP[c_id], fontsize=9, color='#94a3b8')
         continue
         
-    gt_series = total_truth_df[c_grids].mean(axis=1).copy()
+    # 補齊完整每日時間軸，讓 2~3 月缺失日期填入 NaN 以自然斷開紅線
+    gt_series = total_truth_df[c_grids].mean(axis=1).reindex(full_dates)
     gt_series.loc[(gt_series.index >= GAP_START) & (gt_series.index <= GAP_END)] = np.nan
     pred_series = pred_total_df[c_grids].mean(axis=1)
     
