@@ -169,7 +169,6 @@ jan_sub = flow_df.loc["2024-01-25":"2024-01-31"]
 jan_factors = pd.DataFrame([get_cycle_factor(dt, valid_grids) for dt in jan_sub.index], index=jan_sub.index)
 l_jan_end = (jan_sub / jan_factors).median().fillna(M_pre_robust)
 
-# 預先提取 1 月初峰值 (用於 Class 7 震後激增包絡線)
 jan_peaks = flow_df.loc["2024-01-01":"2024-01-10", valid_grids].max().fillna(l_jan_end)
 
 april_sub = flow_df.loc["2024-04-01":"2024-04-07"] if "2024-04-01" in flow_df.index else flow_df.loc["2024-05-01":"2024-05-07"]
@@ -364,7 +363,7 @@ df_metrics.to_csv(csv_path, index=False, encoding="utf-8-sig")
 print(f"✓ 各類別官方標準 NRMSE 評估表已匯出至：{csv_path}")
 
 # =========================================================================
-# 5. 繪製 9 大類別圖譜
+# 5. 繪製 9 大類別圖譜 (已修復 GAP 斷線問題)
 # =========================================================================
 print("\n[4/5] 繪製 9 大類別獨立圖與 3x3 總覽圖...")
 
@@ -374,13 +373,16 @@ COLOR_PRED = '#10b981'
 COLOR_BASE = '#64748b'
 COLOR_GAP = '#f59e0b'
 
-actual_plot_df = flow_df.copy()
+# 補齊完整日曆連續日期，使 2~3 月 (GAP 區間) 擁有 NaN 斷點，避免折線自動相連
+full_calendar_dates = pd.date_range(flow_df.index.min(), flow_df.index.max(), freq='D')
+actual_plot_df = flow_df.reindex(full_calendar_dates)
 actual_plot_df.loc[(actual_plot_df.index >= GAP_START) & (actual_plot_df.index <= GAP_END)] = np.nan
+
 pred_plot_df = pred_df[pred_df.index >= PRED_START].copy()
 
 baseline_df = pd.DataFrame(
-    dow_medians_pre.loc[flow_df.index.dayofweek, valid_grids].values,
-    index=flow_df.index,
+    dow_medians_pre.loc[full_calendar_dates.dayofweek, valid_grids].values,
+    index=full_calendar_dates,
     columns=valid_grids
 )
 
@@ -390,7 +392,7 @@ for c_id in range(1, 10):
     if not c_grids: continue
     class_series[c_id] = {
         "name": CLASS_INFO_MAP[c_id],
-        "dates": flow_df.index,
+        "dates": actual_plot_df.index,
         "actual": actual_plot_df[c_grids].mean(axis=1),
         "baseline": baseline_df[c_grids].mean(axis=1),
         "pred_dates": pred_plot_df.index,
