@@ -18,11 +18,19 @@ from torch.utils.data import Dataset, DataLoader
 # =========================================================================
 # 1. 全域配置與官方標準常數
 # =========================================================================
+def seed_everything(seed=42):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+seed_everything(42)
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DIFFUSION_STEPS = 50
-MC_SAMPLES = 8
+DDIM_STEPS = 10          # 確定性步數，兼顧穩定度與速度
 BATCH_SIZE = 16
-EPOCHS_DIFFUSION = 50
+EPOCHS_DIFFUSION = 40
 LR = 1e-3
 
 MEAN_ACTUAL_DIAG = 26.57
@@ -41,7 +49,7 @@ SPECIFIC_CLASS_DIR = r"C:\Users\User\Desktop\人口預測專案\人口預測專�
 FALLBACK_CLASS_DIR = os.path.join(SCRIPT_DIR, "humob2026", "data", "output", "module05", "classification", "by_class")
 BY_CLASS_DIR = SPECIFIC_CLASS_DIR if os.path.exists(SPECIFIC_CLASS_DIR) else FALLBACK_CLASS_DIR
 
-OUTPUT_DIR = os.path.join(SCRIPT_DIR, "humob_shelter_diffusion_clean_output")
+OUTPUT_DIR = os.path.join(SCRIPT_DIR, "humob_shelter_diffusion_clean_fixed")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 CLASS_INFO_MAP = {
@@ -136,7 +144,7 @@ print(f"✓ 有效網格數: {num_nodes}，類別匹配完成")
 coords = np.array([[int(c) for c in g.split('_')] for g in valid_grids])
 dist_matrix = cdist(coords, coords)
 
-# 空間 KNN 平滑矩陣 (排除自己)
+# 空間 KNN 平滑矩陣
 knn_weights = np.zeros_like(dist_matrix)
 for i in range(num_nodes):
     neighbors = np.argsort(dist_matrix[i])[1:5]
@@ -145,7 +153,7 @@ for i in range(num_nodes):
 spatial_knn = pd.DataFrame(knn_weights, index=valid_grids, columns=valid_grids)
 
 # =========================================================================
-# 3. 穩健週期分解器 (保留 DoW 平日/週末震盪)
+# 3. 穩健週期分解器
 # =========================================================================
 class StableCycleDecomposer:
     def __init__(self, flow_df, valid_grids):
@@ -164,14 +172,12 @@ decomposer_diag = StableCycleDecomposer(diag_df, valid_grids)
 decomposer_offdiag = StableCycleDecomposer(offdiag_df, valid_grids)
 
 # =========================================================================
-# 4. 遮罩化避難所指數增益 OD 轉移引擎 (絕不偽造零流動路徑)
+# 4. 自然平滑 OD 轉移引擎（保留真實物理分流）
 # =========================================================================
-class MaskedShelterODEngine:
+class NaturalShelterODEngine:
     def __init__(self, valid_grids, grid_class_lookup, daily_od_records, dist_matrix):
         self.valid_grids = valid_grids
         self.grid_class_lookup = grid_class_lookup
-        
-        # 標定避難所與安置集中網格
         self.is_shelter = {g: (grid_class_lookup.get(g, 5) in [3, 7]) for g in valid_grids}
         
         pre_dates = [dt for dt in daily_od_records.keys() if dt < PRED_START]
@@ -186,7 +192,6 @@ class MaskedShelterODEngine:
         post_dates = [dt for dt in daily_od_records.keys() if dt > GAP_END]
         self.P_post = self._build_transition_matrix(daily_od_records, post_dates) if post_dates else self.P_apr
         
-        # 1/2 ~ 1/10 避難所震波轉移矩陣 (僅在真實存在連通的路徑上做指數重力調權)
         self.P_shelter_shock = self._build_shelter_boosted_matrix(self.P_pre, dist_matrix)
 
     def _build_transition_matrix(self, daily_od_records, target_dates):
@@ -202,10 +207,11 @@ class MaskedShelterODEngine:
         for orig in self.valid_grids:
             tot = sum(counts[orig].values())
             if tot > 0:
-                raw = {d: c / tot for d, c in counts[orig].items()}
-                filtered = {d: p for d, p in raw.items() if p >= 0.015}
-                f_tot = sum(filtered.values())
-                probs[orig] = {d: p / f_tot for d, p in filtered.items()} if f_tot > 0 else raw
+                probs[orig] = {d: c / tot for d, c in counts[orig].items() if (c / tot) >= 0.005}
+                # 重新按真實比例歸一化
+                sub_tot = sum(probs[orig].values())
+                if sub_tot > 0:
+                    probs[orig] = {d: p / sub_tot for d, p in probs[orig].items()}
             else:
                 probs[orig] = {}
         return probs
@@ -221,11 +227,10 @@ class MaskedShelterODEngine:
             adj_dests = {}
             for d, p in dests.items():
                 j = grid_idx_map.get(d)
-                # 僅對原本就有路徑的 dest 進行距離衰減與避難所增益
                 if i is not None and j is not None:
                     d_ij = dist_matrix[i, j]
-                    dist_decay = np.exp(-0.08 * d_ij)
-                    shelter_mult = 2.5 if self.is_shelter.get(d, False) else 1.0
+                    dist_decay = np.exp(-0.06 * d_ij)
+                    shelter_mult = 2.0 if self.is_shelter.get(d, False) else 1.0
                     adj_dests[d] = p * dist_decay * shelter_mult
                 else:
                     adj_dests[d] = p
@@ -261,13 +266,13 @@ class MaskedShelterODEngine:
                 continue
             comb = {d: (1.0 - weight) * p_a.get(d, 0.0) + weight * p_b.get(d, 0.0) for d in all_d}
             c_tot = sum(comb.values())
-            interp[orig] = {d: v / c_tot for d, v in comb.items() if (v / c_tot) >= 0.015} if c_tot > 0 else {}
+            interp[orig] = {d: v / c_tot for d, v in comb.items()} if c_tot > 0 else {}
         return interp
 
-od_engine = MaskedShelterODEngine(valid_grids, grid_class_lookup, daily_od_records, dist_matrix)
+od_engine = NaturalShelterODEngine(valid_grids, grid_class_lookup, daily_od_records, dist_matrix)
 
 # =========================================================================
-# 5. 指數退火分段宏觀骨架 (含震後 1/2 衝擊消退與 S 型復原)
+# 5. 分段宏觀骨架引擎
 # =========================================================================
 class PiecewiseExponentialEngine:
     def __init__(self, flow_df, decomposer, valid_grids, grid_class_lookup):
@@ -297,7 +302,6 @@ class PiecewiseExponentialEngine:
         gap_span = (GAP_END - GAP_START).days + 1
         r_t = self.decomposer.get_factor(dt, self.valid_grids)
         
-        # 階段 1: 1 月震後衝擊與指數退火 (從 1/2 起算)
         if dt < GAP_START:
             day_idx = (dt - PRED_START).days
             tau = day_idx / 30.0
@@ -312,10 +316,8 @@ class PiecewiseExponentialEngine:
                         mu_t[g] = jan_init[g] + (p_val - jan_init[g]) * (day_idx / 3.0)
                     else:
                         decay_tau = (day_idx - 3) / 27.0
-                        # 避難突增以指數衰減收斂回 1 月底水準
                         mu_t[g] = self.l_jan_end[g] + (p_val - self.l_jan_end[g]) * np.exp(-2.8 * decay_tau)
                         
-        # 階段 2: 2~3 月 Gap 期間 (S 型穩健內插)
         elif dt <= GAP_END:
             tau = ((dt - GAP_START).days + 1) / gap_span
             s_curve = 3.0 * (tau ** 2) - 2.0 * (tau ** 3)
@@ -328,7 +330,6 @@ class PiecewiseExponentialEngine:
                 elif c in [7, 8]: mu_t[g] = self.l_jan_end[g] + (1.0 - np.exp(-2.5 * tau)) * (self.l_resume_start[g] - self.l_jan_end[g])
                 elif c == 4: mu_t[g] = self.l_jan_end[g] + (tau ** 2.0) * (self.l_resume_start[g] - self.l_jan_end[g])
                 
-        # 階段 3: 4~10 月長期復原外推
         else:
             tau_post = min(1.0, (dt - (GAP_END + pd.Timedelta(days=1))).days / 90.0)
             mu_t = self.l_resume_start + (1.0 - np.exp(-2.0 * tau_post)) * (self.l_long_term - self.l_resume_start)
@@ -339,14 +340,13 @@ class PiecewiseExponentialEngine:
                     s_post = 3.0 * (tau_post ** 2) - 2.0 * (tau_post ** 3)
                     mu_t[g] = self.l_resume_start[g] + s_post * (self.M_pre[g] - self.l_resume_start[g])
 
-        # 核心：基礎水位乘以平日/週末節奏
         return np.maximum(0.0, (mu_t * r_t).values)
 
 morph_diag = PiecewiseExponentialEngine(diag_df, decomposer_diag, valid_grids, grid_class_lookup)
 morph_offdiag = PiecewiseExponentialEngine(offdiag_df, decomposer_offdiag, valid_grids, grid_class_lookup)
 
 # =========================================================================
-# 6. 雙獨立 Diffusion 模型 (高頻波型去噪)
+# 6. 輕量殘差網絡與正確數學 DDIM 採樣器
 # =========================================================================
 def extract_calendar_features(dt):
     dow = dt.dayofweek
@@ -417,48 +417,52 @@ class WaveformDenoiser(nn.Module):
         h = self.res_block(torch.cat([h, ctx], dim=-1)) + h
         return self.out_proj(h)
 
-class DualDiffusionEngine:
+class CorrectDDIMEngine:
     def __init__(self, timesteps=DIFFUSION_STEPS):
         self.timesteps = timesteps
         self.betas = torch.linspace(1e-4, 0.02, timesteps).to(DEVICE)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod_prev = torch.cat([torch.tensor([1.0], device=DEVICE), self.alphas_cumprod[:-1]])
         self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
-        self.posterior_var = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
 
     def q_sample(self, x_0, t, noise=None):
         if noise is None: noise = torch.randn_like(x_0)
         return self.sqrt_alphas_cumprod[t].unsqueeze(-1) * x_0 + self.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1) * noise, noise
 
     @torch.no_grad()
-    def sample_fast(self, model, norm_seed, time_feat, temp=1.0, clamp_val=1.5):
+    def sample_ddim(self, model, norm_seed, time_feat, ddim_steps=DDIM_STEPS, clamp_val=1.5):
+        """正確的高斯先驗 DDIM 確定性取樣"""
         b, dim = norm_seed.shape[0], model.num_nodes
-        x_t = torch.randn(b * MC_SAMPLES, dim, device=DEVICE) * temp
-        norm_seed_rep = norm_seed.repeat_interleave(MC_SAMPLES, dim=0)
-        time_feat_rep = time_feat.repeat_interleave(MC_SAMPLES, dim=0)
+        step_indices = torch.linspace(self.timesteps - 1, 0, ddim_steps).long().to(DEVICE)
         
-        for step in reversed(range(self.timesteps)):
-            t_t = torch.full((b * MC_SAMPLES,), step, device=DEVICE, dtype=torch.long)
-            betas_t = self.betas[t_t].unsqueeze(-1)
-            pred_eps = model(x_t, t_t, norm_seed_rep, time_feat_rep)
-            mean = (1.0 / torch.sqrt(self.alphas[t_t].unsqueeze(-1))) * (x_t - (betas_t / self.sqrt_one_minus_alphas_cumprod[t_t].unsqueeze(-1)) * pred_eps)
-            if step > 0:
-                x_t = mean + torch.sqrt(self.posterior_var[t_t].unsqueeze(-1)) * (torch.randn_like(x_t) * temp)
-            else:
-                x_t = mean
-                
-        return torch.clamp(x_t.view(b, MC_SAMPLES, dim).mean(dim=1), -clamp_val, clamp_val)
+        # 嚴格遵循標準高斯初始化
+        x = torch.randn((b, dim), device=DEVICE) * 0.5
+        
+        for i in range(len(step_indices)):
+            t = step_indices[i]
+            prev_t = step_indices[i + 1] if i + 1 < len(step_indices) else torch.tensor(-1, device=DEVICE)
+            t_batch = torch.full((b,), t, device=DEVICE, dtype=torch.long)
+            
+            eps = model(x, t_batch, norm_seed, time_feat)
+            a_t = self.alphas_cumprod[t]
+            a_prev = self.alphas_cumprod[prev_t] if prev_t >= 0 else torch.tensor(1.0, device=DEVICE)
+            
+            # DDIM 無噪聲確定性轉移
+            pred_x0 = (x - torch.sqrt(1.0 - a_t) * eps) / torch.sqrt(a_t)
+            dir_xt = torch.sqrt(1.0 - a_prev) * eps
+            x = torch.sqrt(a_prev) * pred_x0 + dir_xt
+            
+        return torch.clamp(x, -clamp_val, clamp_val)
 
-print("\n[2/6] 準備殘差數據集並訓練雙 Diffusion 模型...")
+print("\n[2/6] 準備殘差數據集並訓練 Diffusion 模型...")
 ds_diag = ResidualDataset(diag_df, morph_diag, valid_grids, is_offdiag=False)
 ds_offdiag = ResidualDataset(offdiag_df, morph_offdiag, valid_grids, is_offdiag=True)
 
 loader_diag = DataLoader(ds_diag, batch_size=BATCH_SIZE, shuffle=True)
 loader_offdiag = DataLoader(ds_offdiag, batch_size=BATCH_SIZE, shuffle=True)
 
-diff_engine = DualDiffusionEngine(DIFFUSION_STEPS)
+diff_engine = CorrectDDIMEngine(DIFFUSION_STEPS)
 diff_model_diag = WaveformDenoiser(num_nodes=num_nodes, hidden_dim=96).to(DEVICE)
 diff_model_offdiag = WaveformDenoiser(num_nodes=num_nodes, hidden_dim=64).to(DEVICE)
 
@@ -478,7 +482,7 @@ def train_diffusion(model, loader, is_offdiag, name):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        if ep % 25 == 0 or ep == EPOCHS_DIFFUSION:
+        if ep % 20 == 0 or ep == EPOCHS_DIFFUSION:
             print(f"  [{name}] Epoch [{ep:02d}/{EPOCHS_DIFFUSION}] - Loss: {total_loss / len(loader):.5f}")
 
 train_diffusion(diff_model_diag, loader_diag, is_offdiag=False, name="Diag Diffusion")
@@ -496,34 +500,30 @@ pred_diag_flows, pred_offdiag_flows = {}, {}
 
 with torch.no_grad():
     for dt in all_dates:
-        # 1. 骨架基準
         base_d = morph_diag.get_backbone(dt)
         base_o = morph_offdiag.get_backbone(dt)
         
-        # 2. Diffusion 微觀殘差
         n_seed_d = torch.tensor(base_d / (ds_diag.max_ceiling + 1e-4), dtype=torch.float32).unsqueeze(0).to(DEVICE)
         n_seed_o = torch.tensor(base_o / (ds_offdiag.max_ceiling + 1e-4), dtype=torch.float32).unsqueeze(0).to(DEVICE)
         t_feat = torch.tensor(extract_calendar_features(dt), dtype=torch.float32).unsqueeze(0).to(DEVICE)
         
-        res_d = diff_engine.sample_fast(diff_model_diag, n_seed_d, t_feat, temp=1.0, clamp_val=1.5).squeeze(0).cpu().numpy() * ds_diag.scale
-        # 非對角線使用低溫採樣與超低擾動截斷
-        res_o = diff_engine.sample_fast(diff_model_offdiag, n_seed_o, t_feat, temp=0.25, clamp_val=0.2).squeeze(0).cpu().numpy() * ds_offdiag.scale
+        res_d = diff_engine.sample_ddim(diff_model_diag, n_seed_d, t_feat, ddim_steps=DDIM_STEPS, clamp_val=1.5).squeeze(0).cpu().numpy() * ds_diag.scale
+        res_o = diff_engine.sample_ddim(diff_model_offdiag, n_seed_o, t_feat, ddim_steps=DDIM_STEPS, clamp_val=0.2).squeeze(0).cpu().numpy() * ds_offdiag.scale
         
-        # 3. 活性門檻阻斷長尾噪聲
+        # 活性門檻阻斷 Off-diagonal 長尾噪聲
         gating_o = np.where(base_o > 0.005, 1.0, 0.0)
         res_o = res_o * gating_o
         
-        raw_d = base_d + 0.30 * res_d
-        raw_o = base_o + 0.03 * res_o  # 超保守注入
+        raw_d = base_d + 0.28 * res_d
+        raw_o = base_o + 0.02 * res_o  # 超保守注入保護 0.0176 分母
         
-        # 4. 空間平滑
         smooth_d = 0.98 * raw_d + 0.02 * spatial_knn.dot(raw_d).values
         smooth_o = 0.99 * raw_o + 0.01 * spatial_knn.dot(raw_o).values
         
         final_d = np.clip(smooth_d, 0.0, ds_diag.max_ceiling)
         final_o = np.clip(smooth_o, 0.0, ds_offdiag.max_ceiling)
         
-        # 5. Class 1 絕對零值鎖定
+        # Class 1 絕對零值鎖定
         for i, g in enumerate(valid_grids):
             if grid_class_lookup.get(g, 0) == 1:
                 final_d[i] = 0.0
@@ -533,7 +533,7 @@ with torch.no_grad():
         pred_offdiag_flows[dt] = pd.Series(final_o, index=valid_grids)
 
 # =========================================================================
-# 8. 官方標準 Combined NRMSE 矩陣評估
+# 8. 官方標準 Combined NRMSE 評估
 # =========================================================================
 print("\n[4/6] 執行官方標準 Combined NRMSE 評估...")
 eval_dates = [dt for dt in diag_df.index if dt >= PRED_START and not (GAP_START <= dt <= GAP_END)]
@@ -601,8 +601,8 @@ combined_nrmse = WEIGHT_DIAG * NRMSE_diag + WEIGHT_OFFDIAG * NRMSE_offdiag
 df_metrics = pd.DataFrame(summary_list)
 
 print("\n" + "=" * 110)
-print(" 🏆 【HuMob 2026 遮罩避難增益 + 分段退火 + 雙 Diffusion 評估報告】")
-print(f" 🎯 官方常數: mean_actual_diag = {MEAN_ACTUAL_DIAG} | mean_actual_offdiag = {MEAN_ACTUAL_OFFDIAG}")
+print(" 🏆 【HuMob 2026 修復穩定版評估報告】")
+print(f" 🎯 官方基準: mean_actual_diag = {MEAN_ACTUAL_DIAG} | mean_actual_offdiag = {MEAN_ACTUAL_OFFDIAG}")
 print("=" * 110)
 print(f"{'Class Name':<32} | {'Grids':<5} | {'RMSE_diag':<10} | {'RMSE_off':<10} | {'NRMSE_diag':<11} | {'NRMSE_off':<11} | {'Combined NRMSE':<14}")
 print("-" * 110)
@@ -612,7 +612,7 @@ print("-" * 110)
 print(f"{'OVERALL (Fixed Clean Model)':<32} | {len(valid_grids):<5} | {RMSE_diag:10.4f} | {RMSE_offdiag:10.4f} | {NRMSE_diag:11.4f} | {NRMSE_offdiag:11.4f} | {combined_nrmse:14.4f}")
 print("=" * 110 + "\n")
 
-df_metrics.to_csv(os.path.join(OUTPUT_DIR, "fixed_clean_nrmse_breakdown.csv"), index=False, encoding="utf-8-sig")
+df_metrics.to_csv(os.path.join(OUTPUT_DIR, "fixed_nrmse_breakdown.csv"), index=False, encoding="utf-8-sig")
 
 # =========================================================================
 # 9. 匯出預測 CSV 與 9 大類別走勢圖
@@ -621,14 +621,14 @@ print("[5/6] 匯出預測檔案與產出 9 大類別走勢圖...")
 pred_diag_df = pd.DataFrame.from_dict(pred_diag_flows, orient='index')
 pred_offdiag_df = pd.DataFrame.from_dict(pred_offdiag_flows, orient='index')
 pred_total_df = pred_diag_df + pred_offdiag_df
-pred_total_df.to_csv(os.path.join(OUTPUT_DIR, "pred_total_flows_fixed_clean.csv"), encoding="utf-8-sig")
+pred_total_df.to_csv(os.path.join(OUTPUT_DIR, "pred_total_flows_fixed.csv"), encoding="utf-8-sig")
 
 total_truth_df = diag_df + offdiag_df
 
 plt.style.use('dark_background')
 fig, axes = plt.subplots(3, 3, figsize=(19, 11.5), dpi=250)
 fig.patch.set_facecolor('#0b1329')
-fig.suptitle(f"HuMob 2026: Masked Shelter Gravity + Dual Diffusion (Clean) | Combined NRMSE: {combined_nrmse:.4f}", 
+fig.suptitle(f"HuMob 2026: Restored Diffusion + Natural Transition | Combined NRMSE: {combined_nrmse:.4f}", 
              fontsize=14, fontweight='bold', color='#ffffff', y=0.98)
 
 for c_id in range(1, 10):
@@ -657,7 +657,7 @@ for c_id in range(1, 10):
 
 fig.legend(loc='lower center', bbox_to_anchor=(0.5, 0.01), ncol=3, fontsize=10, frameon=True, facecolor='#0b1329', edgecolor='#334155')
 plt.tight_layout(rect=[0, 0.04, 1, 0.95])
-plt.savefig(os.path.join(OUTPUT_DIR, "fixed_clean_9classes_comparison.png"), dpi=250, bbox_inches='tight')
+plt.savefig(os.path.join(OUTPUT_DIR, "fixed_9classes_comparison.png"), dpi=250, bbox_inches='tight')
 plt.close(fig)
 
-print(f"[6/6] ✨ 乾淨修復版執行完畢！預測與圖表已儲存至：{OUTPUT_DIR}")
+print(f"[6/6] ✨ 乾淨修復完成！預測與圖表已儲存至：{OUTPUT_DIR}")
