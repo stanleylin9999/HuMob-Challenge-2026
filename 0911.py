@@ -315,13 +315,12 @@ class DualAmplitudeWaveletForecaster:
         self.valid_grids = valid_grids
         self.is_offdiag = is_offdiag
         
-        # 儲存週期分析與振幅特徵
         self.large_periods = {}
         self.small_periods = {}
         self.A_large_pre = {}
         self.A_large_post = {}
         self.phase_large = {}
-        self.wavelet_components_pred = {}  # 儲存小波多尺度外推預測模板
+        self.wavelet_components_pred = {}
         
         self._analyze_and_fit()
 
@@ -342,15 +341,11 @@ class DualAmplitudeWaveletForecaster:
             y_pre = pre_df[g].values
             y_post = post_df[g].values if len(post_df) > 0 else y_pre
             
-            # -------------------------------------------------------------
             # 1. 大振幅萃取與週期分析 (主週期 T_large)
-            # -------------------------------------------------------------
-            # 使用長窗 Savitzky-Golay 提取 4 月後的平滑中心線
             w_win = min(35, len(y_post) if len(y_post) % 2 == 1 else len(y_post) - 1)
             macro_post = savgol_filter(y_post, window_length=max(7, w_win), polyorder=1)
             detrend_post = y_post - macro_post
             
-            # FFT 頻譜分析抓出大振幅主週期
             fft_vals = np.abs(rfft(detrend_post))
             fft_freqs = rfftfreq(len(detrend_post), d=1.0)
             if len(fft_vals) > 1:
@@ -360,19 +355,16 @@ class DualAmplitudeWaveletForecaster:
             else:
                 T_large = 7.0
             
-            # 物理鎖定：人口移動的大振幅以每週（約 7 天）為準
             self.large_periods[g] = round(float(T_large), 2)
-            omega_large = 2 * np.pi / 7.0  # 鎖定 7 天基頻防止多網格相消
+            omega_large = 2 * np.pi / 7.0
             
-            # 求解 4 月後大振幅擺幅與相位
             X_large = np.column_stack([np.cos(omega_large * t_post), np.sin(omega_large * t_post)])
             c_l, _, _, _ = np.linalg.lstsq(X_large, detrend_post, rcond=None)
             amp_large_post = np.sqrt(c_l[0]**2 + c_l[1]**2)
             phi_large = np.arctan2(-c_l[1], c_l[0])
             
-            # 災前大振幅
             detrend_pre = y_pre - np.median(y_pre)
-            X_pre = np.column_stack([np.cos(omega_large * t_pre), np.sin(omega_pre := 2 * np.pi / 7.0 * t_pre)])
+            X_pre = np.column_stack([np.cos(omega_large * t_pre), np.sin(omega_large * t_pre)])
             c_pre, _, _, _ = np.linalg.lstsq(X_pre, detrend_pre, rcond=None)
             amp_large_pre = np.sqrt(c_pre[0]**2 + c_pre[1]**2)
             
@@ -380,13 +372,10 @@ class DualAmplitudeWaveletForecaster:
             self.A_large_post[g] = float(amp_large_post)
             self.phase_large[g] = float(phi_large)
             
-            # -------------------------------------------------------------
             # 2. 小振幅獨立：殘差分離與次週期分析 (次週期 T_small)
-            # -------------------------------------------------------------
             w_large_curve = c_l[0] * np.cos(omega_large * t_post) + c_l[1] * np.sin(omega_large * t_post)
-            r_small = detrend_post - w_large_curve  # 獨立出來的小振幅波動
+            r_small = detrend_post - w_large_curve
             
-            # 次週期頻譜分析 (去除 DC 附近的低頻)
             fft_small = np.abs(rfft(r_small))
             if len(fft_small) > 2:
                 sub_idx = np.argmax(fft_small[2:]) + 2
@@ -396,18 +385,11 @@ class DualAmplitudeWaveletForecaster:
                 T_small = 3.5
             self.small_periods[g] = round(float(T_small), 2)
             
-            # -------------------------------------------------------------
             # 3. 小振幅小波多解析度分析 (PyWavelets MRA) 與預測外推
-            # -------------------------------------------------------------
-            # 保留相對變化率
             eta = r_small / np.maximum(macro_post, 0.1)
-            
-            # 使用 sym4 進行 3 階離散小波多尺度分解
             level = min(3, pywt.dwt_max_level(len(eta), 'sym4'))
             if level >= 1:
                 coeffs = pywt.wavedec(eta, 'sym4', level=level)
-                
-                # 分解出各頻階細節分量 (D1: ~2天高頻, D2: ~3.5天中頻, D3: 低頻殘留)
                 reconstructed_details = []
                 for i in range(1, len(coeffs)):
                     zero_coeffs = [np.zeros_like(c) for c in coeffs]
@@ -415,13 +397,11 @@ class DualAmplitudeWaveletForecaster:
                     d_signal = pywt.waverec(zero_coeffs, 'sym4')[:len(eta)]
                     reconstructed_details.append(d_signal)
                 
-                # 將各小波層依據一週 7 天 (DOW 0~6) 提取穩定的相位週循環特徵
                 dow_post = np.array([dt.dayofweek for dt in post_dates])
                 wavelet_dow_profile = np.zeros(7)
                 for d in range(7):
                     mask = (dow_post == d)
                     if np.any(mask):
-                        # 疊加各小波細節層的特徵中位數
                         val = sum(np.median(layer[mask]) for layer in reconstructed_details)
                         wavelet_dow_profile[d] = val
                 
@@ -434,7 +414,6 @@ class DualAmplitudeWaveletForecaster:
         day_t = (dt - PRED_START).days
         dow = dt.dayofweek
         
-        # 1~3 月平滑過渡，4 月之後完全具備 4 月振幅特徵
         if dt < GAP_START:
             blend_post = 0.0
         elif dt <= GAP_END:
@@ -450,17 +429,17 @@ class DualAmplitudeWaveletForecaster:
             c = grid_class_lookup.get(g, 5)
             mu_val = float(mu_series[g])
             
-            # Class 1 絕對零值鎖定
-            if c == 1 or mu_val <= 1e-4:
+            # Class 1 絕對零值鎖定，且非對角線時 Class 3 強制歸零
+            if c == 1 or (self.is_offdiag and c == 3) or mu_val <= 1e-4:
                 pred_vals[i] = 0.0
                 continue
                 
-            # 1. 大振幅預測：學自 4 月的振幅與相位
+            # 1. 大振幅預測
             A_l = (1.0 - blend_post) * self.A_large_pre[g] + blend_post * self.A_large_post[g]
             phi_l = self.phase_large[g]
             W_large = A_l * np.cos(omega_large * day_t + phi_l)
             
-            # 2. 小振幅小波預測：多尺度小波重構特徵
+            # 2. 小振幅小波預測
             eta_pred = self.wavelet_components_pred[g][dow]
             scale_damp = 0.4 if self.is_offdiag else 0.85
             W_small_wavelet = mu_val * eta_pred * scale_damp
@@ -508,9 +487,12 @@ for dt in all_dates:
     final_o = np.clip(smooth_o, 0.0, trend_offdiag_engine.max_ceiling.values)
     
     for i, g in enumerate(valid_grids):
-        if grid_class_lookup.get(g, 0) == 1:
+        c_id = grid_class_lookup.get(g, 0)
+        if c_id == 1:
             final_d[i] = 0.0
             final_o[i] = 0.0
+        elif c_id == 3:
+            final_o[i] = 0.0  # 強制將 Class 3 的 offdiag 鎖定為 0
             
     pred_diag_flows[dt] = pd.Series(final_d, index=valid_grids)
     pred_offdiag_flows[dt] = pd.Series(final_o, index=valid_grids)
