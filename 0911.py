@@ -10,7 +10,6 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from scipy.spatial.distance import cdist
-from scipy.signal import savgol_filter
 
 import torch
 import torch.nn as nn
@@ -106,6 +105,7 @@ if os.path.exists(TSV_PATH):
     raw_df['date_dt'] = pd.to_datetime(raw_df['date'].astype(str), format='%Y%m%d')
     raw_df = raw_df.sort_values('date_dt').reset_index(drop=True)
 else:
+    print(" -> 未偵測到原始資料集，生成合成資料供管線驗證...")
     date_rng = pd.date_range("2023-11-01", "2024-10-31", freq="D")
     synth_grids = [f"{y}_{x}" for y in range(40, 45) for x in range(40, 45)]
     records = []
@@ -150,7 +150,6 @@ offdiag_df = offdiag_df[valid_grids]
 num_nodes = len(valid_grids)
 print(f"✓ 有效網格節點數: {num_nodes}")
 
-# 空間拓撲距離
 coords = np.array([[int(c) for c in g.split('_')] for g in valid_grids])
 dist_matrix = cdist(coords, coords)
 knn_weights = np.zeros_like(dist_matrix)
@@ -161,7 +160,7 @@ for i in range(num_nodes):
 spatial_knn = pd.DataFrame(knn_weights, index=valid_grids, columns=valid_grids)
 
 # =========================================================================
-# 3. OD 轉移引擎 (提供非對角線機率分佈預測)
+# 3. OD 轉移引擎
 # =========================================================================
 class NaturalShelterODEngine:
     def __init__(self, valid_grids, grid_class_lookup, daily_od_records, dist_matrix):
@@ -463,10 +462,13 @@ ot_model_diag = train_flow_matching(diag_df, macro_baseline_diag, valid_grids, g
 ot_model_offdiag = train_flow_matching(offdiag_df, macro_baseline_offdiag, valid_grids, grid_class_lookup, epochs=25, tag="Off-Diagonal")
 
 # =========================================================================
-# 6. 空窗期 ODE 數值求解與推論
+# 6. 空窗期 RK4 ODE 數值求解與推論 (批次化並行 Ensemble)
 # =========================================================================
 @torch.no_grad()
-def solve_ot_gap_inpainting(model, flow_df, baseline_df, valid_grids, grid_class_lookup, is_offdiag=False, steps=20):
+def solve_ot_gap_inpainting(
+    model, flow_df, baseline_df, valid_grids, grid_class_lookup, 
+    is_offdiag=False, steps=15, solver="rk4", ensemble_size=8
+):
     gap_dates = pd.date_range(GAP_START, GAP_END, freq="D")
     pre_day = GAP_START - pd.Timedelta(days=1)
     post_day = GAP_END + pd.Timedelta(days=1)
@@ -477,43 +479,68 @@ def solve_ot_gap_inpainting(model, flow_df, baseline_df, valid_grids, grid_class
         return inpainted_df
 
     model.eval()
+    dt = 1.0 / steps
+
     for g in valid_grids:
         c_id = grid_class_lookup.get(g, 5)
         
-        # 物理邊界規則：Class 1 全面歸零；若為非對角線則 Class 3 強制歸零
+        # 物理邊界規則：Class 1 全面歸零；Class 3 之非對角線強制歸零
         if c_id == 1 or (is_offdiag and c_id == 3):
             inpainted_df.loc[gap_dates, g] = 0.0
             continue
             
         base_series = baseline_df.loc[gap_dates, g].values.astype(np.float32)
-        b_l = (flow_df.loc[pre_day, g] - baseline_df.loc[pre_day, g]) if pre_day in flow_df.index else 0.0
-        b_r = (flow_df.loc[post_day, g] - baseline_df.loc[post_day, g]) if post_day in flow_df.index else 0.0
+        b_l = float(flow_df.loc[pre_day, g] - baseline_df.loc[pre_day, g]) if pre_day in flow_df.index else 0.0
+        b_r = float(flow_df.loc[post_day, g] - baseline_df.loc[post_day, g]) if post_day in flow_df.index else 0.0
         
-        base_tensor = torch.from_numpy(base_series).unsqueeze(0).unsqueeze(0).to(DEVICE)
-        bounds_tensor = torch.tensor([[b_l, b_r]], dtype=torch.float32, device=DEVICE)
-        cid_tensor = torch.tensor([c_id - 1], dtype=torch.long, device=DEVICE)
+        base_tensor = torch.from_numpy(base_series).unsqueeze(0).unsqueeze(0).repeat(ensemble_size, 1, 1).to(DEVICE)
+        bounds_tensor = torch.tensor([[b_l, b_r]], dtype=torch.float32, device=DEVICE).repeat(ensemble_size, 1)
+        cid_tensor = torch.tensor([c_id - 1], dtype=torch.long, device=DEVICE).repeat(ensemble_size)
         
-        ensemble_runs = []
-        for _ in range(8):
-            x = torch.randn(1, 1, GAP_LEN, device=DEVICE)
-            dt = 1.0 / steps
+        x = torch.randn(ensemble_size, 1, GAP_LEN, device=DEVICE)
+        
+        if solver.lower() == "rk4":
             for i in range(steps):
-                t_val = torch.tensor([[i / steps]], dtype=torch.float32, device=DEVICE)
+                t_curr = i / steps
+                t_half = t_curr + 0.5 * dt
+                t_next = (i + 1) / steps
+                
+                t1 = torch.full((ensemble_size, 1), t_curr, dtype=torch.float32, device=DEVICE)
+                k1 = model(x, t1, base_tensor, bounds_tensor, cid_tensor)
+                
+                t2 = torch.full((ensemble_size, 1), t_half, dtype=torch.float32, device=DEVICE)
+                k2 = model(x + 0.5 * dt * k1, t2, base_tensor, bounds_tensor, cid_tensor)
+                
+                t3 = torch.full((ensemble_size, 1), t_half, dtype=torch.float32, device=DEVICE)
+                k3 = model(x + 0.5 * dt * k2, t3, base_tensor, bounds_tensor, cid_tensor)
+                
+                t4 = torch.full((ensemble_size, 1), t_next, dtype=torch.float32, device=DEVICE)
+                k4 = model(x + dt * k3, t4, base_tensor, bounds_tensor, cid_tensor)
+                
+                x = x + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        else:
+            for i in range(steps):
+                t_val = torch.full((ensemble_size, 1), i / steps, dtype=torch.float32, device=DEVICE)
                 v = model(x, t_val, base_tensor, bounds_tensor, cid_tensor)
                 x = x + v * dt
-            ensemble_runs.append(x.squeeze().cpu().numpy())
             
-        gen_residual = np.median(np.stack(ensemble_runs, axis=0), axis=0)
+        gen_residual = np.median(x.squeeze(1).cpu().numpy(), axis=0)
         final_flow = np.clip(base_series + gen_residual, 0.0, None)
         inpainted_df.loc[gap_dates, g] = final_flow
 
     return inpainted_df
 
-print("[2/6] 執行 60 天空窗期 (2~3月) OT-FM ODE 軌跡重構推論...")
-pred_diag_df = solve_ot_gap_inpainting(ot_model_diag, diag_df, macro_baseline_diag, valid_grids, grid_class_lookup, is_offdiag=False)
-pred_offdiag_df = solve_ot_gap_inpainting(ot_model_offdiag, offdiag_df, macro_baseline_offdiag, valid_grids, grid_class_lookup, is_offdiag=True)
+print("[2/6] 執行 60 天空窗期 (2~3月) OT-FM RK4 軌跡重構推論...")
+pred_diag_df = solve_ot_gap_inpainting(
+    ot_model_diag, diag_df, macro_baseline_diag, valid_grids, grid_class_lookup, 
+    is_offdiag=False, steps=15, solver="rk4", ensemble_size=8
+)
+pred_offdiag_df = solve_ot_gap_inpainting(
+    ot_model_offdiag, offdiag_df, macro_baseline_offdiag, valid_grids, grid_class_lookup, 
+    is_offdiag=True, steps=15, solver="rk4", ensemble_size=8
+)
 
-# 空間 KNN 平滑與 Class 3 鎖定
+# 空間 k-NN 平滑與物理邊界約束
 for dt in pd.date_range(GAP_START, GAP_END, freq="D"):
     d_v = pred_diag_df.loc[dt, valid_grids].values
     o_v = pred_offdiag_df.loc[dt, valid_grids].values
@@ -536,7 +563,7 @@ pred_total_df = pred_diag_df + pred_offdiag_df
 total_truth_df = (diag_df + offdiag_df).reindex(all_sim_dates)
 
 # =========================================================================
-# 7. 官方標準 Combined NRMSE 與 April RMSE 評估
+# 7. 官方標準 Combined NRMSE 評估
 # =========================================================================
 print("[3/6] 執行官方標準 Combined NRMSE 評估...")
 eval_dates = [dt for dt in diag_df.index if dt >= PRED_START and not (GAP_START <= dt <= GAP_END)]
@@ -579,7 +606,6 @@ for dt in eval_dates:
     overall_daily_records["diag"].append(np.sqrt(np.mean(all_diag_diffs)) if all_diag_diffs else 0.0)
     overall_daily_records["offdiag"].append(np.sqrt(np.mean(all_off_diffs)) if all_off_diffs else 0.0)
 
-# 計算各類別 4 月 (Apr) 重啟期 RMSE
 apr_eval_dates = [dt for dt in diag_df.index if pd.to_datetime("2024-04-01") <= dt <= pd.to_datetime("2024-04-30")]
 apr_rmse_per_class = {}
 for c_id in range(1, 10):
@@ -632,7 +658,7 @@ summary_rows.append({
 
 df_table = pd.DataFrame(summary_rows)
 print("\n" + "=" * 90)
-print(f" 🏆 HuMob 2026 Flow Matching SOTA (OT-FM) 評估報告 (Combined NRMSE: {combined_nrmse:.4f})")
+print(f" 🏆 HuMob 2026 Flow Matching SOTA (OT-FM + RK4) 評估報告 (Combined NRMSE: {combined_nrmse:.4f})")
 print("=" * 90)
 print(f"{'class id':<10} | {'class name':<38} | {'NRMSE_diag':<10} | {'NRMSE_off':<10} | {'combined NRMSE':<14} | {'Apr RMSE':<8}")
 print("-" * 90)
@@ -640,28 +666,141 @@ for _, r in df_table.iterrows():
     print(f"{r['class id']:<10} | {r['class name']:<38} | {r['NRMSE_diag']:<10.3f} | {r['NRMSE_off']:<10.3f} | {r['combined NRMSE']:<14.3f} | {r['Apr RMSE']:<8.2f}")
 print("=" * 90 + "\n")
 
-table_path = os.path.join(OUTPUT_DIR, "otfm_nrmse_summary.csv")
+table_path = os.path.join(OUTPUT_DIR, "otfm_rk4_nrmse_summary.csv")
 df_table.to_csv(table_path, index=False, encoding="utf-8-sig")
 
-# =========================================================================
-# 8. SOTA 基準暗黑視覺化圖表產出 (366-Day Waveform Benchmark)
-# =========================================================================
-print("[4/6] 匯出預測 CSV 檔案...")
-pred_diag_df.to_csv(os.path.join(OUTPUT_DIR, "pred_diag_otfm.csv"), encoding="utf-8-sig")
-pred_offdiag_df.to_csv(os.path.join(OUTPUT_DIR, "pred_offdiag_otfm.csv"), encoding="utf-8-sig")
-pred_total_df.to_csv(os.path.join(OUTPUT_DIR, "pred_total_otfm.csv"), encoding="utf-8-sig")
+# 匯出預測 CSV 檔案
+pred_diag_df.to_csv(os.path.join(OUTPUT_DIR, "pred_diag_otfm_rk4.csv"), encoding="utf-8-sig")
+pred_offdiag_df.to_csv(os.path.join(OUTPUT_DIR, "pred_offdiag_otfm_rk4.csv"), encoding="utf-8-sig")
+pred_total_df.to_csv(os.path.join(OUTPUT_DIR, "pred_total_otfm_rk4.csv"), encoding="utf-8-sig")
 
-print("[5/6] 渲染 9 大類別 SOTA 波形基準對比大圖 (366-Day Waveform Benchmark)...")
+# =========================================================================
+# 8. 對角線與非對角線 3×3 基準圖繪製 (完全還原樣式規格)
+# =========================================================================
+def render_flow_component_benchmark(
+    gt_df: pd.DataFrame, 
+    pred_df: pd.DataFrame, 
+    flow_title: str, 
+    nrmse_val: float, 
+    output_filename: str
+):
+    """
+    依照使用者指定的高對比暗黑風格渲染 3x3 九大類別波形圖：
+    包含棕暗紅 Gap 覆蓋區間、粉紅 Actual Flow、青綠 Flow Matching Model，以及底部精確圖例。
+    """
+    gt_reindexed = gt_df.reindex(all_sim_dates)
+    pred_reindexed = pred_df.reindex(all_sim_dates)
+
+    plt.style.use('dark_background')
+    fig, axes = plt.subplots(3, 3, figsize=(22, 12), dpi=250)
+    fig.patch.set_facecolor('#070c18')
+
+    # 主標題格式：HuMob 2026: Flow Matching (OT-FM) ({flow_title} Flow) | NRMSE: {val:.4f}
+    fig.suptitle(
+        f"HuMob 2026: Flow Matching (OT-FM) ({flow_title} Flow) | NRMSE: {nrmse_val:.4f}",
+        fontsize=14, fontweight='bold', color='#f8fafc', y=0.985
+    )
+
+    for c_id in range(1, 10):
+        row, col = (c_id - 1) // 3, (c_id - 1) % 3
+        ax = axes[row, col]
+        ax.set_facecolor('#0d1527')
+
+        c_grids = [g for g in valid_grids if grid_class_lookup.get(g) == c_id]
+        c_meta = CLASS_METADATA[c_id]
+        grid_n = len(c_grids)
+
+        # 子圖標題格式：Class 01: Persistent Zero (N=28)
+        title_str = f"Class {c_id:02d}: {c_meta['name']} (N={grid_n})"
+        ax.set_title(title_str, fontsize=9.5, fontweight='bold', color='#cbd5e1', pad=6)
+
+        if not c_grids:
+            ax.set_xticks([])
+            ax.set_yticks([])
+            continue
+
+        gt_series = gt_reindexed[c_grids].mean(axis=1)
+        pred_series = pred_reindexed[c_grids].mean(axis=1)
+
+        # Gap 區間 Actual Flow 遮蔽以呈現真實資料缺失狀態
+        gt_masked = gt_series.copy()
+        gt_masked.loc[(gt_masked.index >= GAP_START) & (gt_masked.index <= GAP_END)] = np.nan
+
+        # 1. 繪製 Gap 區塊 (暗褐紅/深琥珀背景)
+        ax.axvspan(GAP_START, GAP_END, color='#45271d', alpha=0.52, zorder=1)
+
+        # 2. 繪製 Flow Matching 重建軌跡 (青綠色線條)
+        ax.plot(pred_series.index, pred_series, color='#2dd4bf', linewidth=1.15, alpha=0.95, zorder=2)
+
+        # 3. 繪製 Actual Flow 真實流量 (粉紅玫瑰色線條)
+        ax.plot(gt_masked.index, gt_masked, color='#f43f5e', linewidth=1.1, alpha=0.9, zorder=3)
+
+        # 樣式微調：刻度、邊框與格線
+        ax.grid(True, color='#1e293b', linestyle=':', alpha=0.45, zorder=0)
+        ax.tick_params(colors='#64748b', labelsize=7.5, length=3)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d'))
+        ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
+        ax.set_xlim(pd.to_datetime("2023-11-01"), pd.to_datetime("2024-11-01"))
+
+        for spine in ax.spines.values():
+            spine.set_color('#1e293b')
+            spine.set_linewidth(0.8)
+
+    # 底部圖例 (Gap, Actual Flow, Flow Matching Model)
+    legend_elements = [
+        matplotlib.patches.Patch(facecolor='#45271d', alpha=0.7, label='Gap'),
+        plt.Line2D([0], [0], color='#f43f5e', lw=1.3, label='Actual Flow'),
+        plt.Line2D([0], [0], color='#2dd4bf', lw=1.4, label='Flow Matching Model')
+    ]
+
+    fig.legend(
+        handles=legend_elements, 
+        loc='lower center', 
+        bbox_to_anchor=(0.5, 0.015), 
+        ncol=3, 
+        fontsize=9.5,
+        frameon=True, 
+        facecolor='#0a1020', 
+        edgecolor='#1e293b'
+    )
+
+    plt.tight_layout(rect=[0.02, 0.045, 0.98, 0.96])
+    out_path = os.path.join(OUTPUT_DIR, output_filename)
+    plt.savefig(out_path, dpi=250, bbox_inches='tight')
+    plt.close(fig)
+    print(f"✓ 已產出基準圖片: {out_path}")
+
+print("[4/6] 渲染對角線 (Diagonal Flow) 基準對比圖...")
+render_flow_component_benchmark(
+    gt_df=diag_df,
+    pred_df=pred_diag_df,
+    flow_title="Diagonal",
+    nrmse_val=NRMSE_diag,
+    output_filename="humob_flow_matching_diagonal_benchmark.png"
+)
+
+print("[5/6] 渲染非對角線 (Off-Diagonal Flow) 基準對比圖...")
+render_flow_component_benchmark(
+    gt_df=offdiag_df,
+    pred_df=pred_offdiag_df,
+    flow_title="Off-Diagonal",
+    nrmse_val=NRMSE_offdiag,
+    output_filename="humob_flow_matching_offdiagonal_benchmark.png"
+)
+
+# =========================================================================
+# 9. 渲染總流量 (Total Flow) 綜合波形大圖
+# =========================================================================
+print("[6/6] 渲染總流量 366 天綜合全域對比大圖...")
 macro_total_baseline = macro_baseline_diag + macro_baseline_offdiag
 
-plt.style.use('dark_background')
-fig, axes = plt.subplots(3, 3, figsize=(22, 13), dpi=260)
+fig, axes = plt.subplots(3, 3, figsize=(22, 13), dpi=250)
 fig.patch.set_facecolor('#040914')
 
 fig.suptitle(
-    "HuMob 2026: 9-Class Waveform Benchmark — Flow Matching SOTA (OT-FM)\n"
-    f"(Ground Truth vs Adaptive Baseline vs Flow Matching SOTA (OT-FM) 366-Day Reconstruction | NRMSE: {combined_nrmse:.4f})", 
-    fontsize=15, fontweight='bold', color='#f8fafc', y=0.985
+    "HuMob 2026: 9-Class Waveform Benchmark — Flow Matching SOTA (OT-FM + RK4)\n"
+    f"(Ground Truth vs Adaptive Baseline vs OT-FM (RK4) 366-Day Reconstruction | Combined NRMSE: {combined_nrmse:.4f})", 
+    fontsize=14, fontweight='bold', color='#f8fafc', y=0.985
 )
 
 for c_id in range(1, 10):
@@ -705,20 +844,23 @@ for c_id in range(1, 10):
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=2))
 
-legend_elements = [
+legend_elements_total = [
     plt.Line2D([0], [0], color='#f43f5e', lw=1.3, label='Ground Truth (Observed)'),
     plt.Line2D([0], [0], color='#94a3b8', lw=1.2, linestyle='--', label='Adaptive Baseline'),
-    plt.Line2D([0], [0], color='#2dd4bf', lw=1.5, label='Flow Matching SOTA (OT-FM) Prediction'),
+    plt.Line2D([0], [0], color='#2dd4bf', lw=1.5, label='Flow Matching SOTA (OT-FM + RK4)'),
     matplotlib.patches.Patch(facecolor='#0f4c5c', alpha=0.45, label='60-Day Blind Zone'),
     matplotlib.patches.Patch(facecolor='#1e3a8a', alpha=0.35, label='Official Eval (Apr)')
 ]
 
-fig.legend(handles=legend_elements, loc='lower center', bbox_to_anchor=(0.5, 0.015), ncol=5, fontsize=10.5,
+fig.legend(handles=legend_elements_total, loc='lower center', bbox_to_anchor=(0.5, 0.015), ncol=5, fontsize=10,
            frameon=True, facecolor='#060d1f', edgecolor='#1e293b')
 
 plt.tight_layout(rect=[0, 0.04, 1, 0.96])
-benchmark_plot_path = os.path.join(OUTPUT_DIR, "humob_flow_matching_sota_benchmark.png")
-plt.savefig(benchmark_plot_path, dpi=260, bbox_inches='tight')
+total_plot_path = os.path.join(OUTPUT_DIR, "humob_flow_matching_total_benchmark.png")
+plt.savefig(total_plot_path, dpi=250, bbox_inches='tight')
 plt.close(fig)
 
-print(f"[6/6] ✨ 執行完成！SOTA 模型預測、NRMSE 報告與 366 天對比圖已儲存至：\n -> {OUTPUT_DIR}")
+print(f"\n✨ 全部完成！3 張對比圖表已全數匯出至資料夾：\n -> {OUTPUT_DIR}")
+print("  1. humob_flow_matching_diagonal_benchmark.png    (對角線 3x3 流量圖)")
+print("  2. humob_flow_matching_offdiagonal_benchmark.png (非對角線 3x3 流量圖 - 樣式對齊)")
+print("  3. humob_flow_matching_total_benchmark.png       (總流量綜合對比圖)")
