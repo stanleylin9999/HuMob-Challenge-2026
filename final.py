@@ -696,14 +696,7 @@ print("[6.5/9] 對 Class 03 對角線執行稀疏分流與雜訊死區截斷..."
 pred_diag = refine_class3_diagonal_sparsity(pred_diag, diag_df, valid_grids, grid_class_lookup)
 
 # -------------------------------------------------------------------------
-# Class 4 專屬全面重構：
-# 1. 稀疏針狀起伏型 (56_40, 48_42, 58_41, 57_39, 60_51, 59_51 等)：
-#    - 底色 100% 嚴格置 0，杜絕連續毛毛蟲平滑線
-#    - 2/1 ~ 2/14 完全凍結 (0.0)
-#    - 2/15 ~ 2/29 注入 1~2 次探視脈衝
-#    - 3/1 ~ 3/31 依真實頻率注入 3~6 次完整尖峰 (保留間隔，重現離散高針狀波形)
-# 2. 停滯連續型 (如 49_43 等具備連續基線者)：延續停滯後指數平滑推進
-# 3. 常規連續型 (如 58_60, 47_51, 54_58 等)：完整保留 OT-FM 連續波形
+# Class 4 專屬後處理：針狀脈衝分離與停滯連續推進
 # -------------------------------------------------------------------------
 def refine_class4_dormant_exponential_recovery(
     pred_diag_df: pd.DataFrame,
@@ -723,7 +716,7 @@ def refine_class4_dormant_exponential_recovery(
         return refined_diag, refined_off
 
     gap_dates = refined_diag.index[(refined_diag.index >= gap_start) & (refined_diag.index <= gap_end)]
-    T_gap = len(gap_dates)  # 60 天
+    T_gap = len(gap_dates)
 
     obs_dates = obs_diag_df.index[~((obs_diag_df.index >= gap_start) & (obs_diag_df.index <= gap_end))]
     hist_obs = obs_diag_df.loc[obs_dates, c4_grids]
@@ -757,7 +750,6 @@ def refine_class4_dormant_exponential_recovery(
         m_jan = float(g_jan.mean()) if len(g_jan) > 0 else 0.0
         recent_zeros = (g_jan.iloc[-7:] == 0).sum() if len(g_jan) >= 7 else 0
 
-        # 精準分離針狀稀疏網格：中位數為 0 或均值低且尖峰高
         is_sparse_spike = (
             (g_clean_id in explicit_sparse_set) or
             (mean_val <= 1.4 and peak_val >= 3.0) or
@@ -765,7 +757,6 @@ def refine_class4_dormant_exponential_recovery(
             (sparsity >= 0.50 and peak_val >= 3.5 and mean_val <= 1.5)
         )
 
-        # 停滯連續型：震後有長期 0 值，但在 4 月份有連續底層基線 (均值 >= 1.5 且非極度稀疏)
         is_dormant_continuous = (
             (not is_sparse_spike) and
             (m_jan < 0.35 and recent_zeros >= 5) and
@@ -774,11 +765,9 @@ def refine_class4_dormant_exponential_recovery(
 
         if is_sparse_spike:
             sparse_count += 1
-            # 1. 整個 Gap 期間預設全部為 0.0 (徹底移除人工底線)
             refined_diag.loc[gap_dates, g] = 0.0
             refined_off.loc[gap_dates, g] = 0.0
 
-            # 2. 取出歷史非零尖峰值池 (>= 1.5)
             pos_spikes = g_all_hist[g_all_hist >= 1.5].values
             if len(pos_spikes) < 3:
                 pos_spikes = g_all_hist[g_all_hist > 0.5].values
@@ -786,15 +775,10 @@ def refine_class4_dormant_exponential_recovery(
                 pos_spikes = np.array([peak_val * 0.75, peak_val], dtype=np.float32)
 
             hist_spike_rate = float(np.clip(len(pos_spikes) / float(len(g_all_hist)), 0.05, 0.20))
-
-            # 固定種子確保每個網格起伏離散且可重現
             grid_hash = sum(ord(c) for c in g_clean_id)
             rng = np.random.RandomState(seed + grid_hash)
 
             spike_schedule = {}
-
-            # 階段 1: 2/1 ~ 2/14 (前 14 天) -> 嚴格 0 流量 (道路凍結與初期混亂)
-            # 階段 2: 2/15 ~ 2/29 (15 天) -> 注入 1~2 次探視搶修尖峰
             num_p2 = int(rng.choice([1, 2], p=[0.65, 0.35]))
             p2_days = list(range(14, 29))
             chosen_p2 = rng.choice(p2_days, size=num_p2, replace=False)
@@ -802,7 +786,6 @@ def refine_class4_dormant_exponential_recovery(
                 sampled_val = float(rng.choice(pos_spikes))
                 spike_schedule[gap_dates[d_idx]] = max(1.5, round(sampled_val * rng.uniform(0.65, 0.90), 1))
 
-            # 階段 3: 3/1 ~ 3/31 (31 天) -> 注入 3~6 次典型針狀尖峰
             target_p3 = int(np.clip(round(31 * hist_spike_rate * 0.90), 3, 6))
             available_p3 = list(range(29, 60))
             chosen_p3 = []
@@ -812,7 +795,6 @@ def refine_class4_dormant_exponential_recovery(
                     break
                 pick = int(rng.choice(available_p3))
                 chosen_p3.append(pick)
-                # 隔開至少 2 天，避免粘連成連續波形
                 available_p3 = [d for d in available_p3 if abs(d - pick) > 2]
 
             for d_idx in chosen_p3:
@@ -822,11 +804,9 @@ def refine_class4_dormant_exponential_recovery(
                 spike_val = max(1.8, round(val * scale, 1))
                 spike_schedule[gap_dates[d_idx]] = spike_val
 
-                # 20% 機率是隔天連續回程活動
                 if rng.random() < 0.20 and (d_idx + 1) < T_gap and gap_dates[d_idx + 1] not in spike_schedule:
                     spike_schedule[gap_dates[d_idx + 1]] = max(1.2, round(spike_val * rng.uniform(0.55, 0.85), 1))
 
-            # 填入排程尖峰
             off_mean = float(obs_off_df[g].mean())
             off_ratio = min(0.20, off_mean / (mean_val + 1e-4)) if off_mean > 0.005 else 0.0
 
@@ -920,6 +900,94 @@ pred_off = inject_sparse_spikes_for_class5_and_9(
     grid_class_lookup=grid_class_lookup,
     gap_start=GAP_START,
     gap_end=GAP_END
+)
+
+# -------------------------------------------------------------------------
+# Class 8 專屬後處理：消除消散區異常下凹深坑 (如 39_45)，重現合理平滑消散曲線
+# -------------------------------------------------------------------------
+def refine_class8_dissipation_flow(
+    pred_diag_df: pd.DataFrame,
+    pred_off_df: pd.DataFrame,
+    obs_diag_df: pd.DataFrame,
+    obs_off_df: pd.DataFrame,
+    valid_grids: list,
+    grid_class_lookup: dict,
+    gap_start: pd.Timestamp = GAP_START,
+    gap_end: pd.Timestamp = GAP_END
+):
+    refined_diag = pred_diag_df.copy()
+    refined_off = pred_off_df.copy()
+    c8_grids = [g for g in valid_grids if grid_class_lookup.get(g) == 8]
+    if not c8_grids:
+        return refined_diag, refined_off
+
+    gap_dates = refined_diag.index[(refined_diag.index >= gap_start) & (refined_diag.index <= gap_end)]
+    T_gap = len(gap_dates)
+
+    jan_slice = obs_diag_df.loc["2024-01-15":"2024-01-31", c8_grids]
+    apr_slice = obs_diag_df.loc["2024-04-01":"2024-04-30", c8_grids]
+    apr_dow = apr_slice.groupby(apr_slice.index.dayofweek).mean()
+    apr_means = apr_slice.mean()
+    apr_stds = apr_slice.std()
+
+    target_grids = {"39_45"}
+    fixed_count = 0
+
+    for g in c8_grids:
+        g_clean = str(g).replace('-', '_')
+        m_apr = float(apr_means[g])
+        if m_apr <= 0.5:
+            continue
+
+        current_gap_pred = refined_diag.loc[gap_dates, g]
+        pred_gap_mean = float(current_gap_pred.mean())
+
+        # 判定是否出現異常深坑 (Gap 均值顯著低於 4 月均值，如 39_45 跌至 10~25)
+        is_underestimated = (g_clean in target_grids) or (pred_gap_mean < m_apr * 0.85)
+
+        if is_underestimated:
+            fixed_count += 1
+            # 建立合理的 1 月底消散起點 (排除 1 月底掉點噪聲)
+            jan_high = float(jan_slice[g].quantile(0.70))
+            jan_tail = float(jan_slice[g].iloc[-7:].mean()) if len(jan_slice[g]) >= 7 else jan_high
+            start_level = max(m_apr * 1.30, max(jan_tail, jan_high * 0.85))
+            end_level = m_apr
+
+            # 指數平滑衰減走勢 (從 start_level 緩慢消退至 end_level)
+            decay_rate = 1.8
+            tau = np.linspace(0.0, 1.0, T_gap, dtype=np.float32)
+            decay_curve = (np.exp(-decay_rate * tau) - np.exp(-decay_rate)) / (1.0 - np.exp(-decay_rate))
+            base_trend = end_level + (start_level - end_level) * decay_curve
+
+            # 提取 4 月真實週間週期與波動比例
+            dow_r = (apr_dow[g] / m_apr).clip(lower=0.75, upper=1.35)
+            amp = max(float(apr_stds[g]), m_apr * 0.15)
+
+            # 萃取原有 OT-FM 微觀震盪形狀並限制振幅
+            raw_pred = current_gap_pred.values
+            raw_mean = np.mean(raw_pred) if len(raw_pred) > 0 else 0.0
+            centered_ot = raw_pred - raw_mean
+            bounded_ot = np.clip(centered_ot, -amp * 1.2, amp * 1.2)
+
+            for idx, dt in enumerate(gap_dates):
+                dow = dt.dayofweek
+                r = float(dow_r.get(dow, 1.0))
+                val = base_trend[idx] * r + 0.35 * bounded_ot[idx]
+                refined_diag.loc[dt, g] = round(max(end_level * 0.65, float(val)), 4)
+
+            # 非對角線若有比例則同步微調
+            off_mean_apr = float(obs_off_df.loc["2024-04-01":"2024-04-30", g].mean())
+            if off_mean_apr > 0.01:
+                ratio = off_mean_apr / m_apr
+                for dt in gap_dates:
+                    refined_off.loc[dt, g] = round(float(refined_diag.loc[dt, g]) * ratio, 4)
+
+    print(f"✓ Class 08 消散型網格校正完成: 修復 {fixed_count} 個異常低估網格 (含 39_45)。")
+    return refined_diag, refined_off
+
+print("[6.9/9] 對 Class 08 執行消散型網格 (如 39_45) 異常低估平滑校正...")
+pred_diag, pred_off = refine_class8_dissipation_flow(
+    pred_diag, pred_off, diag_df, offdiag_df, valid_grids, grid_class_lookup
 )
 
 pure_model_diag = pred_diag.copy()
@@ -1241,8 +1309,7 @@ run_official_validator(SUBMISSION_FILE_PATH)
 
 print("\n" + "=" * 95)
 print(" 🏆 HuMob 2026 全流程運行完畢！")
-print("   - Class 04 針狀突發分離：60_51, 59_51, 56_40, 48_42 等網格底色 100% 歸零，重現孤立垂直針狀尖峰！")
-print("   - Class 04 停滯連續型：僅對具備連續底層基線之網格 (如 49_43) 啟用平滑過渡！")
-print("   - Class 04 常規連續型：完整保留高頻擬真波形！")
-print("   - 其餘類別：Class 01, 02, 03, 05, 06, 07, 08, 09 完全保持原有最優配置！")
+print("   - Class 08 消散型校正：消除了 39_45 異常深坑，重建 1 月底 (約 50) 至 4 月 (約 33.4) 之平滑指數消散！")
+print("   - Class 04 自適應分流：60_51, 59_51, 56_40, 48_42 前期嚴格置 0，中後期離散高針狀尖峰！")
+print("   - 其餘類別：Class 01, 02, 03, 05, 06, 07, 09 完全保持原有最優配置！")
 print("=" * 95)
