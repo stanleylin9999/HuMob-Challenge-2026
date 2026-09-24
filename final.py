@@ -16,9 +16,6 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-# =========================================================================
-# 1. 全域配置、隨機種子與官方標準評估常數
-# =========================================================================
 def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -33,30 +30,21 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals(
 CLEAN_SCRIPT_DIR = os.path.abspath(os.path.normpath(str(SCRIPT_DIR).strip().replace('\xa0', ' ')))
 os.makedirs(CLEAN_SCRIPT_DIR, exist_ok=True)
 
-# 自動探測 TSV 檔案路徑
 candidate_tsvs = glob.glob(os.path.join(CLEAN_SCRIPT_DIR, "**", "*dataset*.tsv"), recursive=True) + \
                  glob.glob(os.path.join(CLEAN_SCRIPT_DIR, "*dataset*.tsv"))
 TSV_PATH = candidate_tsvs[0] if candidate_tsvs else os.path.join(CLEAN_SCRIPT_DIR, "humob2026-dataset.tsv")
 
-# 自動探測 by_class 分類目錄
 candidate_class_dirs = [
-    os.path.join(CLEAN_SCRIPT_DIR, "by_class"),
-    os.path.join(CLEAN_SCRIPT_DIR, "humob2026", "data", "output", "module05", "classification", "by_class"),
-    r"C:\Users\User\Desktop\人口預測專案\人口預測專案3\humob2026\data\output\module05\classification\by_class"
+    os.path.join(CLEAN_SCRIPT_DIR, "by_class")
 ]
 BY_CLASS_DIR = next((c for c in candidate_class_dirs if os.path.exists(c) and len(glob.glob(os.path.join(c, "*.csv"))) > 0), None)
 
-# 官方競賽標準評估常數
+
 MEAN_ACTUAL_DIAG = 26.57
 MEAN_ACTUAL_OFFDIAG = 0.0176
 WEIGHT_DIAG = 0.5
 WEIGHT_OFFDIAG = 0.5
 
-BASELINE1_DIAG_RMSE = 2.8527
-BASELINE1_DIAG_NRMSE = 0.1074
-BASELINE1_OFFDIAG_RMSE = 0.006070
-BASELINE1_OFFDIAG_NRMSE = 0.3449
-BASELINE1_COMBINED_NRMSE = 0.2261
 
 PRED_START = pd.to_datetime("2024-01-01")
 GAP_START = pd.to_datetime("2024-02-01")
@@ -89,9 +77,7 @@ def safe_save_fig(fig, file_path, dpi=220):
         else:
             raise e
 
-# =========================================================================
-# 2. 嚴格邊界過濾 (經度 x: 30~70, 緯度 y: 35~70) 與資料讀取
-# =========================================================================
+
 def get_class_id(fname):
     f = fname.lower()
     if "zero" in f: return 1
@@ -114,7 +100,6 @@ def is_within_official_boundary(grid_str):
     except:
         return False
 
-print("[1/9] 載入類別對應表與真實 OD 資料集 (嚴格限定 x:30~70, y:35~70)...")
 grid_class_lookup = {}
 if BY_CLASS_DIR and os.path.exists(BY_CLASS_DIR):
     for fpath in glob.glob(os.path.join(BY_CLASS_DIR, "*.csv")):
@@ -151,7 +136,7 @@ for dt, val in zip(raw_df['date_dt'], raw_df['od_matrix_raw']):
 
 valid_grids = sorted(list(grid_class_lookup.keys()))
 num_nodes = len(valid_grids)
-print(f"✓ 成功載入 {num_nodes} 個範圍內有效網格 (x:30~70, y:35~70)")
+print(f"成功載入 {num_nodes} 個範圍內有效網格 (x:30~70, y:35~70)")
 
 diag_dict, off_dict = {}, {}
 for dt, day_od in daily_od_records.items():
@@ -164,10 +149,6 @@ for dt, day_od in daily_od_records.items():
 diag_df = pd.DataFrame.from_dict(diag_dict, orient='index').fillna(0.0).astype(np.float32)
 offdiag_df = pd.DataFrame.from_dict(off_dict, orient='index').fillna(0.0).astype(np.float32)
 
-# =========================================================================
-# 3. 4 月經驗稀疏先驗 OD 轉移機率矩陣引擎
-# =========================================================================
-print("[2/9] 構建 4 月經驗稀疏先驗轉移引擎 (鎖定非對角線拓撲)...")
 class EmpiricalAprilTransferEngine:
     def __init__(self, valid_grids, daily_od_records):
         self.valid_grids = valid_grids
@@ -204,9 +185,6 @@ class EmpiricalAprilTransferEngine:
 
 transfer_engine = EmpiricalAprilTransferEngine(valid_grids, daily_od_records)
 
-# =========================================================================
-# 4. 可微分自適應 Sigmoid 學習器 (供通用類別求取物理參數)
-# =========================================================================
 class DifferentiablePlateauSigmoid(nn.Module):
     def __init__(self, num_entities=9, init_k=6.0, init_taum=0.5):
         super().__init__()
@@ -241,7 +219,7 @@ def learn_plateau_sigmoid_parameters(
     epochs: int = 350,
     lr: float = 0.04
 ):
-    print("[3/9] 執行 PyTorch 梯度下降自適應學習 Sigmoid 物理參數 (k, tau_m)...")
+    
     learn_dates = pd.date_range("2024-01-15", "2024-04-30", freq="D")
     T_total = len(learn_dates)
 
@@ -292,9 +270,6 @@ def learn_plateau_sigmoid_parameters(
 
 learned_k_dict, learned_taum_dict = learn_plateau_sigmoid_parameters(diag_df, grid_class_lookup, valid_grids)
 
-# =========================================================================
-# 5. 動力學基線引擎 (常規連續型維持過渡)
-# =========================================================================
 class LearnedSigmoidDynamicEngine:
     def __init__(self, flow_df, valid_grids, grid_class_lookup, k_dict, taum_dict, is_offdiag=False):
         self.flow_df = flow_df
@@ -425,10 +400,7 @@ macro_diag_df, meta_diag_df = LearnedSigmoidDynamicEngine(diag_df, valid_grids, 
 macro_offdiag_df, meta_offdiag_df = LearnedSigmoidDynamicEngine(offdiag_df, valid_grids, grid_class_lookup, learned_k_dict, learned_taum_dict, True).generate(all_sim_dates)
 all_meta_df = pd.concat([meta_diag_df, meta_offdiag_df], ignore_index=True)
 
-# =========================================================================
-# 6. OT-FM 殘差網絡訓練與 Batched RK4 推論
-# =========================================================================
-print("[4/9] 訓練 OT-FM 殘差網絡並以 RK4 求解零均值有機微觀震盪...")
+
 class FastOTUNet(nn.Module):
     def __init__(self, hidden=48, num_classes=9):
         super().__init__()
@@ -542,9 +514,6 @@ def solve_batched_rk4(model, base_df, is_offdiag=False, steps=4, ensemble_size=4
 pred_diag = solve_batched_rk4(ot_diag, macro_diag_df, is_offdiag=False)
 pred_off = solve_batched_rk4(ot_off, macro_offdiag_df, is_offdiag=True)
 
-# -------------------------------------------------------------------------
-# Class 6 專屬：動態包絡線約束插值
-# -------------------------------------------------------------------------
 def apply_class6_envelope_morphing(
     pred_df: pd.DataFrame,
     obs_df: pd.DataFrame,
@@ -616,13 +585,9 @@ def apply_class6_envelope_morphing(
 otfm_diag_res = pred_diag - macro_diag_df
 otfm_off_res = pred_off - macro_offdiag_df
 
-print("[5/9] 對 Class 06 執行包絡線約束插值校正...")
 pred_diag = apply_class6_envelope_morphing(pred_diag, diag_df, otfm_diag_res, valid_grids, grid_class_lookup)
 pred_off = apply_class6_envelope_morphing(pred_off, offdiag_df, otfm_off_res, valid_grids, grid_class_lookup)
 
-# -------------------------------------------------------------------------
-# Class 2 專屬修復：震後崩塌網格死區抑制
-# -------------------------------------------------------------------------
 def refine_class2_collapsed_grids(
     pred_diag_df: pd.DataFrame,
     obs_diag_df: pd.DataFrame,
@@ -648,15 +613,11 @@ def refine_class2_collapsed_grids(
             refined.loc[gap_dates, g] = 0.0
             suppressed_cnt += 1
 
-    print(f"✓ Class 02 崩塌撤離區修正完成: 靜默置零 {suppressed_cnt} 格。")
+    
     return refined
 
-print("[6/9] 對 Class 02 執行重災崩塌網格抑制校正...")
 pred_diag = refine_class2_collapsed_grids(pred_diag, diag_df, valid_grids, grid_class_lookup)
 
-# -------------------------------------------------------------------------
-# Class 3 專屬修復：稀疏分流與雜訊死區截斷
-# -------------------------------------------------------------------------
 def refine_class3_diagonal_sparsity(
     pred_diag_df: pd.DataFrame,
     obs_diag_df: pd.DataFrame,
@@ -689,15 +650,12 @@ def refine_class3_diagonal_sparsity(
             refined.loc[gap_dates, g] = g_series
             active_cnt += 1
 
-    print(f"✓ Class 03 稀疏噪聲過濾完成: 靜默置零 {silent_cnt} 格，保留活躍樞紐 {active_cnt} 格。")
+    
     return refined
 
-print("[6.5/9] 對 Class 03 對角線執行稀疏分流與雜訊死區截斷...")
+
 pred_diag = refine_class3_diagonal_sparsity(pred_diag, diag_df, valid_grids, grid_class_lookup)
 
-# -------------------------------------------------------------------------
-# Class 4 專屬後處理：針狀脈衝分離與停滯連續推進
-# -------------------------------------------------------------------------
 def refine_class4_dormant_exponential_recovery(
     pred_diag_df: pd.DataFrame,
     pred_off_df: pd.DataFrame,
@@ -832,17 +790,14 @@ def refine_class4_dormant_exponential_recovery(
                     r = float(dow_r.get(dow, 1.0))
                     refined_diag.loc[dt, g] = round(max(0.0, flow_curve[idx] * r), 4)
 
-    print(f"✓ Class 04 針狀突發分離校正完成: 稀疏針狀起伏型 {sparse_count} 格 (含 60_51, 59_51, 56_40 等)，停滯連續型 {dormant_count} 格。")
+    
     return refined_diag, refined_off
 
-print("[6.6/9] 對 Class 04 執行針狀脈衝分離與後處理校正...")
+
 pred_diag, pred_off = refine_class4_dormant_exponential_recovery(
     pred_diag, pred_off, diag_df, offdiag_df, valid_grids, grid_class_lookup
 )
 
-# -------------------------------------------------------------------------
-# Class 5 與 Class 9 非對角線：離散量子化脈衝校正
-# -------------------------------------------------------------------------
 def inject_sparse_spikes_for_class5_and_9(
     pred_off_df: pd.DataFrame,
     obs_off_df: pd.DataFrame,
@@ -892,7 +847,6 @@ def inject_sparse_spikes_for_class5_and_9(
 
     return refined_pred
 
-print("[6.8/9] 對 Class 05 與 Class 09 非對角線執行離散量子化脈衝校正...")
 pred_off = inject_sparse_spikes_for_class5_and_9(
     pred_off_df=pred_off,
     obs_off_df=offdiag_df,
@@ -902,9 +856,7 @@ pred_off = inject_sparse_spikes_for_class5_and_9(
     gap_end=GAP_END
 )
 
-# -------------------------------------------------------------------------
-# Class 8 專屬後處理：消除消散區異常下凹深坑 (如 39_45)，重現合理平滑消散曲線
-# -------------------------------------------------------------------------
+
 def refine_class8_dissipation_flow(
     pred_diag_df: pd.DataFrame,
     pred_off_df: pd.DataFrame,
@@ -982,10 +934,10 @@ def refine_class8_dissipation_flow(
                 for dt in gap_dates:
                     refined_off.loc[dt, g] = round(float(refined_diag.loc[dt, g]) * ratio, 4)
 
-    print(f"✓ Class 08 消散型網格校正完成: 修復 {fixed_count} 個異常低估網格 (含 39_45)。")
+    
     return refined_diag, refined_off
 
-print("[6.9/9] 對 Class 08 執行消散型網格 (如 39_45) 異常低估平滑校正...")
+
 pred_diag, pred_off = refine_class8_dissipation_flow(
     pred_diag, pred_off, diag_df, offdiag_df, valid_grids, grid_class_lookup
 )
@@ -1001,10 +953,7 @@ pred_total = pred_diag + pred_off
 raw_total = diag_df + offdiag_df
 macro_total = macro_diag_df + macro_offdiag_df
 
-# =========================================================================
-# 7. 官方標準指標評估與報表計算
-# =========================================================================
-print("[7/9] 計算官方標準 Combined NRMSE 指標並匯出資料 CSV...")
+
 eval_dates = [d for d in diag_df.index if d >= PRED_START and not (GAP_START <= d <= GAP_END)]
 N_diag = num_nodes
 N_offdiag = num_nodes * (num_nodes - 1)
@@ -1081,28 +1030,36 @@ pure_apr_nrmse_diag = pure_apr_rmse_diag / MEAN_ACTUAL_DIAG
 pure_apr_nrmse_off = pure_apr_rmse_off / MEAN_ACTUAL_OFFDIAG
 pure_apr_combined = (pure_apr_nrmse_diag + pure_apr_nrmse_off) / 2.0
 
-print("\n" + "=" * 80)
-print(f" 📈 2024 年 4 月專用 NRMSE 評估報表 (評估有效天數: {len(april_dates)} 天)")
-print("=" * 80)
-print(f"{'指標評估維度':<26} | {'本程式純模型':<14} | {'本程式最終管線':<14} | {'Baseline 1 (官方基準)':<16}")
-print("-" * 80)
-print(f"{'Diagonal RMSE':<26} | {pure_apr_rmse_diag:<14.4f} | {final_apr_rmse_diag:<14.4f} | {BASELINE1_DIAG_RMSE:<16.4f}")
-print(f"{'Diagonal NRMSE':<26} | {pure_apr_nrmse_diag:<14.4f} | {final_apr_nrmse_diag:<14.4f} | {BASELINE1_DIAG_NRMSE:<16.4f}")
-print(f"{'Off-diagonal RMSE':<26} | {pure_apr_rmse_off:<14.6f} | {final_apr_rmse_off:<14.6f} | {BASELINE1_OFFDIAG_RMSE:<16.6f}")
-print(f"{'Off-diagonal NRMSE':<26} | {pure_apr_nrmse_off:<14.4f} | {final_apr_nrmse_off:<14.4f} | {BASELINE1_OFFDIAG_NRMSE:<16.4f}")
-print(f"{'Combined NRMSE':<26} | {pure_apr_combined:<14.4f} | {final_apr_combined:<14.4f} | {BASELINE1_COMBINED_NRMSE:<16.4f}")
-print("=" * 80 + "\n")
 
-pd.DataFrame(daily_eval).to_csv(os.path.join(CLEAN_SCRIPT_DIR, "humob_daily_od_metrics.csv"), index=False, encoding="utf-8-sig")
-all_meta_df.to_csv(os.path.join(CLEAN_SCRIPT_DIR, "monday_trend_and_amplitude.csv"), index=False, encoding="utf-8-sig")
-pred_diag.to_csv(os.path.join(CLEAN_SCRIPT_DIR, "pred_diag_flows.csv"), encoding="utf-8-sig")
-pred_off.to_csv(os.path.join(CLEAN_SCRIPT_DIR, "pred_offdiag_flows.csv"), encoding="utf-8-sig")
-pred_total.to_csv(os.path.join(CLEAN_SCRIPT_DIR, "pred_total_flows.csv"), encoding="utf-8-sig")
 
-# =========================================================================
-# 8. 產出對角線與非對角線 Flow Matching 基準圖
-# =========================================================================
-print("[8/9] 繪製對角線與非對角線專用 Flow Matching 基準圖...")
+all_official_grids = sorted([
+    f"{x}_{y}" for x in range(30, 71) for y in range(35, 71)
+])
+
+
+pred_diag_full = pred_diag.reindex(columns=all_official_grids, fill_value=0.0)
+pred_off_full = pred_off.reindex(columns=all_official_grids, fill_value=0.0)
+pred_total_full = pred_total.reindex(columns=all_official_grids, fill_value=0.0)
+
+
+pred_diag_full.to_csv(
+    os.path.join(CLEAN_SCRIPT_DIR, "pred_diag_flows.csv"),
+    encoding="utf-8-sig",
+)
+
+pred_off_full.to_csv(
+    os.path.join(CLEAN_SCRIPT_DIR, "pred_offdiag_flows.csv"),
+    encoding="utf-8-sig",
+)
+
+pred_total_full.to_csv(
+    os.path.join(CLEAN_SCRIPT_DIR, "pred_total_flows.csv"),
+    encoding="utf-8-sig",
+)
+
+
+
+
 def plot_flow_matching_benchmark(
     gt_df: pd.DataFrame,
     pred_df: pd.DataFrame,
@@ -1170,7 +1127,7 @@ def plot_flow_matching_benchmark(
     plt.tight_layout(rect=[0.02, 0.045, 0.98, 0.96])
     safe_save_fig(fig, output_path, dpi=dpi)
     plt.close(fig)
-    print(f"✓ 已產出 {flow_type} 專用對比圖: {os.path.basename(output_path)}")
+    
 
 plot_flow_matching_benchmark(
     gt_df=diag_df, pred_df=pred_diag, flow_type="Diagonal", nrmse_val=NRMSE_diag,
@@ -1186,9 +1143,7 @@ plot_flow_matching_benchmark(
     output_path=os.path.join(CLEAN_SCRIPT_DIR, "humob_benchmark_offdiag_flow.png")
 )
 
-# =========================================================================
-# 9. 生成官方標準 Submission OD 矩陣 TSV 並執行 Validator 自檢
-# =========================================================================
+
 def generate_humob_submission_file(
     pred_diag: pd.DataFrame,
     pred_off: pd.DataFrame,
@@ -1198,7 +1153,7 @@ def generate_humob_submission_file(
     gap_start: str = "2024-02-01",
     gap_end: str = "2024-03-31"
 ):
-    print(f"\n[9/9] 正在生成符合官方驗證標準的 OD 矩陣提交檔案...")
+    
     gap_dates = pd.date_range(gap_start, gap_end, freq="D")
     valid_grids_set = set(valid_grids)
     
@@ -1232,70 +1187,7 @@ def generate_humob_submission_file(
             f.write(f"{date_str}\t{repr(daily_od)}\n")
             total_lines += 1
 
-    print(f"✓ 提交檔案已成功匯出至: {output_path} (共 {total_lines} 天)")
-
-def run_official_validator(submission_path: str):
-    print(">>> 正在呼叫內嵌 Validator 進行規範檢核...")
-    LAT_MIN, LAT_MAX = 1, 70
-    LON_MIN, LON_MAX = 1, 100
-
-    feb_set = {"202402{:02d}".format(i) for i in range(1, 29 + 1)}
-    mar_set = {"202403{:02d}".format(i) for i in range(1, 31 + 1)}
-    feb_set.remove("20240202")
-    mar_set.remove("20240305")
-    date_str_set = feb_set.union(mar_set)
-
-    def in_valid_area(lat, lon):
-        if (LAT_MIN <= lat <= LAT_MAX and LON_MIN <= lon <= LON_MAX) or (lat == -1 and lon == -1):
-            return True
-        return False
-
-    with open(submission_path, "r", encoding="utf-8") as f:
-        lines = [l.rstrip() for l in f if l.strip()]
-
-    assert len(lines) > 0, "檔案不可為空！"
-    subm_dict = {}
-    seen_date_set = set()
-
-    for line_num, l in enumerate(lines):
-        tpl = l.split("\t")
-        assert len(tpl) == 2, f"Line {line_num}: 必須為 2 欄 (Tab 分隔)"
-        date_str, od_matrix_str = tpl
-
-        assert re.match(r"^\d{8}$", date_str), f"Line {line_num}: 日期格式錯誤"
-        assert "20240201" <= date_str <= "20240331", f"Line {line_num}: 日期超出評估區間"
-        assert date_str not in seen_date_set, f"Line {line_num}: 重複日期 {date_str}"
-        seen_date_set.add(date_str)
-
-        if date_str not in date_str_set:
-            continue
-
-        od_matrix = ast.literal_eval(od_matrix_str)
-        assert isinstance(od_matrix, dict), f"Line {line_num}: OD 矩陣必須為 dict"
-        assert len(od_matrix) > 0, f"Line {line_num}: OD 矩陣不可為空"
-
-        for orig_key, v in od_matrix.items():
-            assert re.match(r"^-?\d+_-?\d+$", orig_key), f"Line {line_num}: 起點 key 格式錯誤 `{orig_key}`"
-            lat, lon = [int(p) for p in orig_key.split("_")]
-            assert in_valid_area(lat, lon), f"Line {line_num}: 起點 `{orig_key}` 超出合法邊界"
-            assert isinstance(v, dict), f"Line {line_num}: 起點 `{orig_key}` 的值必須是 dict"
-            assert len(v) > 0, f"Line {line_num}: 起點 `{orig_key}` 沒有任何目標目的地"
-
-            for dest_key, weight in v.items():
-                assert re.match(r"^-?\d+_-?\d+$", dest_key), f"Line {line_num}: 目標 key 格式錯誤 `{dest_key}`"
-                d_lat, d_lon = [int(p) for p in dest_key.split("_")]
-                assert in_valid_area(d_lat, d_lon), f"Line {line_num}: 目標 `{dest_key}` 超出合法邊界"
-                w = float(weight)
-                assert w >= 0.0, f"Line {line_num}: 權重不可為負值 ({orig_key} -> {dest_key}: {w})"
-
-        subm_dict[date_str] = od_matrix
-
-    missing_dates = date_str_set - set(subm_dict.keys())
-    assert len(missing_dates) == 0, f"缺少必要評估日期: {sorted(list(missing_dates))}"
-
-    print("=" * 70)
-    print(" 🎉 Validation passed! 成功通過官方 humob2026_validator.py 驗證！")
-    print("=" * 70)
+    
 
 SUBMISSION_FILE_PATH = os.path.join(CLEAN_SCRIPT_DIR, "submission_humob2026.tsv")
 generate_humob_submission_file(
@@ -1305,11 +1197,3 @@ generate_humob_submission_file(
     valid_grids=valid_grids,
     output_path=SUBMISSION_FILE_PATH
 )
-run_official_validator(SUBMISSION_FILE_PATH)
-
-print("\n" + "=" * 95)
-print(" 🏆 HuMob 2026 全流程運行完畢！")
-print("   - Class 08 消散型校正：消除了 39_45 異常深坑，重建 1 月底 (約 50) 至 4 月 (約 33.4) 之平滑指數消散！")
-print("   - Class 04 自適應分流：60_51, 59_51, 56_40, 48_42 前期嚴格置 0，中後期離散高針狀尖峰！")
-print("   - 其餘類別：Class 01, 02, 03, 05, 06, 07, 09 完全保持原有最優配置！")
-print("=" * 95)
